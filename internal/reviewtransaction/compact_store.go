@@ -1493,6 +1493,13 @@ func validateCompactSuccessor(previousRevision string, previous, next CompactSta
 		// because the bounded action is single-shot; legalDecisionStateTransition
 		// rejects it because the lookup table does not contain the
 		// self-loop row.
+		//
+		// The successor is allowed to differ from the predecessor in the
+		// State field and in the Decision payload's Adjudication field
+		// (the bounded action's external contract, populated by the
+		// DecisionAdjudicationAction consumer). Every other field is
+		// carried byte-identical so the authority revision hash covers
+		// the immutable payload.
 		if previous.State != StateDecisionCarryOn {
 			return fmt.Errorf("%w: a decision-adjudicate-batch transaction must originate from decision_carry_on", ErrInvalidSuccessor)
 		}
@@ -1501,6 +1508,7 @@ func validateCompactSuccessor(previousRevision string, previous, next CompactSta
 		}
 		expected := previous
 		expected.State = next.State
+		expected.Decision = next.Decision
 		if !compactStateEqual(expected, next) {
 			return fmt.Errorf("%w: decision-adjudicate-batch changed unrelated state", ErrInvalidSuccessor)
 		}
