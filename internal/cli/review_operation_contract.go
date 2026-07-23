@@ -25,6 +25,7 @@ const (
 	ReviewIntegrationOperationFinalize = "review.finalize"
 	ReviewIntegrationOperationValidate = "review.validate"
 	ReviewIntegrationOperationBindSDD  = "review.bind_sdd"
+	ReviewIntegrationOperationDecide   = "review.decide"
 )
 
 type reviewIntegrationOperationMetadata struct {
@@ -46,6 +47,7 @@ type reviewIntegrationOperationMetadata struct {
 var reviewIntegrationOperationRegistry = []reviewIntegrationOperationMetadata{
 	{Command: "bind-sdd", Operation: ReviewIntegrationOperationBindSDD, Label: "Review BIND-SDD", ValueFlags: []string{"cwd", "change", "lineage", "expected-binding-revision"}, MutatesAuthority: true, JoinOnTimeout: true, TimeoutRetryable: true},
 	{Command: "capabilities", Operation: "review.capabilities", Label: "Review CAPABILITIES"},
+	{Command: "decide", Operation: ReviewIntegrationOperationDecide, Label: "Review DECIDE", ValueFlags: []string{"cwd", "lineage", "expected-revision", "decision", "reason", "recorded-by"}, MutatesAuthority: true},
 	{Command: "finalize", Operation: ReviewIntegrationOperationFinalize, Label: "Review FINALIZE", ValueFlags: []string{"cwd", "lineage", "validation", "refuter", "evidence", "trace", "result"}, BoolFlags: []string{"failed"}, IntFlags: []string{"correction-lines"}, MutatesAuthority: true},
 	{Command: "repair", Operation: "review.repair", Label: "Review REPAIR", ValueFlags: []string{"cwd", "class", "lineage", "expected-revision", "cause", "disposition", "repository-binding", "actor", "reason", "maintainer-authorization"}, BoolFlags: []string{"preflight"}, MutatesAuthority: true, JoinOnTimeout: true, ReadOnlyFlag: "preflight"},
 	{Command: "start", Operation: "review.start", Label: "Review START", ValueFlags: []string{"cwd", "lineage", "policy", "focus", "base-ref", "projection", "trace"}, BoolFlags: []string{"committed-only", "workspace-overlay"}, MutatesAuthority: true},
@@ -1000,6 +1002,18 @@ func (result ReviewIntegrationOperationResult) Validate() error {
 			!validReviewCapabilitySHA256(binding.Revision) || !validReviewCapabilitySHA256(binding.AuthorityRevision) ||
 			!validReviewCapabilitySHA256(binding.ReceiptHash) || binding.GateContext.Gate != reviewtransaction.GatePostApply {
 			return errors.New("negotiated bind-sdd result is incomplete")
+		}
+	case ReviewIntegrationOperationDecide:
+		var decided ReviewIntegrationDecideResult
+		if err := decodeStrictReviewIntegrationResult(result.Result, &decided); err != nil {
+			return err
+		}
+		if decided.Operation != reviewtransaction.CompactDecideOperation ||
+			strings.TrimSpace(decided.LineageID) == "" ||
+			(decided.Decision != "continue" && decided.Decision != "stop") ||
+			strings.TrimSpace(string(decided.State)) == "" ||
+			!validReviewCapabilitySHA256(decided.StoreRevision) {
+			return errors.New("negotiated decide result is incomplete")
 		}
 	default:
 		return fmt.Errorf("unsupported negotiated review operation %q", result.Operation)

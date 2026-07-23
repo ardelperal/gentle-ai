@@ -1467,9 +1467,11 @@ func validateCompactSuccessor(previousRevision string, previous, next CompactSta
 		// DecisionRequired -> DecisionRequired (idempotent re-apply),
 		// DecisionRequired -> Escalated (--decision stop), and
 		// DecisionRequired -> DecisionCarryOn (--decision continue). The
-		// successor is allowed to differ from the predecessor only in the
-		// State field; everything else is carried byte-identical so the
-		// authority revision hash covers the immutable payload.
+		// successor is allowed to differ from the predecessor in the State
+		// field and in the Decision payload (the CLI records a fresh payload
+		// on every invocation, including idempotent re-applies). Every other
+		// field is carried byte-identical so the authority revision hash
+		// covers the immutable payload.
 		if previous.State != StateDecisionRequired {
 			return fmt.Errorf("%w: a review/decide transaction must originate from decision_required", ErrInvalidSuccessor)
 		}
@@ -1478,6 +1480,7 @@ func validateCompactSuccessor(previousRevision string, previous, next CompactSta
 		}
 		expected := previous
 		expected.State = next.State
+		expected.Decision = next.Decision
 		if !compactStateEqual(expected, next) {
 			return fmt.Errorf("%w: review/decide changed unrelated state", ErrInvalidSuccessor)
 		}

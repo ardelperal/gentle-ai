@@ -312,6 +312,8 @@ func runReviewCommandContext(ctx context.Context, args []string, stdout io.Write
 		return runReviewFacadeFinalize(ctx, args[1:], stdout)
 	case "validate":
 		return runReviewFacadeValidate(ctx, args[1:], stdout)
+	case "decide":
+		return runReviewDecide(ctx, args[1:], stdout)
 	case "bind-sdd":
 		return runReviewBindSDD(ctx, args[1:], stdout)
 	case "reconcile-authority-batch":
@@ -339,6 +341,8 @@ func runReviewCommand(args []string, stdout io.Writer) error {
 		return RunReviewFacadeValidate(args[1:], stdout)
 	case "status":
 		return RunReviewStatus(args[1:], stdout)
+	case "decide":
+		return RunReviewDecide(args[1:], stdout)
 	case "repair":
 		return RunReviewRepair(args[1:], stdout)
 	case "invalidate":
