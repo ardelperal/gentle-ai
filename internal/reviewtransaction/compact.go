@@ -73,6 +73,12 @@ type CompactState struct {
 	CumulativeCorrectionLines int                          `json:"cumulative_correction_lines,omitempty"`
 	ResultDispositions        []CompactResultDisposition   `json:"result_dispositions,omitempty"`
 	ResultReopens             []CompactResultReopen        `json:"result_reopens,omitempty"`
+	// DecisionRequiredEnabled records the immutable routing flag captured for
+	// this review completion. Omitting false preserves legacy revision bytes.
+	DecisionRequiredEnabled bool `json:"decision_required_enabled,omitempty"`
+	// Decision carries the optional review/decide payload authored after a
+	// decision-required pause. It remains nil during CompleteReview routing.
+	Decision *DecisionPayload `json:"decision,omitempty"`
 }
 
 // CompactResultReopenSlot binds one selected lens artifact at the exact
@@ -239,6 +245,9 @@ type CompactReviewInput struct {
 	LensResults     []LensResult
 	Classifications []FindingEvidence
 	RefuterOutcomes []EvidenceResult
+	// DecisionRequiredEnabled opts an all-inconclusive review into the
+	// decision-required pause while false preserves the legacy escalation.
+	DecisionRequiredEnabled bool
 }
 
 func NewCompactState(start Start) (CompactState, error) {
@@ -593,8 +602,8 @@ func validateCompactFindings(state CompactState) error {
 	if !equalStrings(expectedFixIDs, state.FixFindingIDs) {
 		return errors.New("compact fix finding IDs must exactly match candidate-causal corroborated findings")
 	}
-	if unresolved && state.State != StateEscalated {
-		return errors.New("unresolved compact finding routing must be terminally escalated")
+	if unresolved && state.State != StateEscalated && state.State != StateDecisionRequired {
+		return errors.New("unresolved compact finding routing must be escalated or awaiting a decision")
 	}
 	for id := range state.Classifications {
 		if _, exists := seen[id]; !exists {
@@ -815,6 +824,7 @@ func (state *CompactState) CompleteReview(input CompactReviewInput) error {
 			}
 		}
 	}
+	state.DecisionRequiredEnabled = input.DecisionRequiredEnabled
 	state.LensResults = []LensResult{}
 	state.Findings = []Finding{}
 	for index, result := range input.LensResults {
@@ -854,6 +864,7 @@ func (state *CompactState) CompleteReview(input CompactReviewInput) error {
 		}
 		refuted[result.FindingID] = result
 	}
+	var malformedErr error
 	escalate := false
 	for _, finding := range state.Findings {
 		item, severeFinding := classifications[finding.ID]
@@ -889,7 +900,10 @@ func (state *CompactState) CompleteReview(input CompactReviewInput) error {
 		case EvidenceInferential:
 			result, ok := refuted[finding.ID]
 			if !ok {
-				return fmt.Errorf("inferential finding %q requires one refuter outcome", finding.ID)
+				state.Outcomes[finding.ID] = OutcomeInconclusive
+				escalate = true
+				malformedErr = errors.Join(malformedErr, fmt.Errorf("inferential finding %q requires one refuter outcome", finding.ID))
+				continue
 			}
 			switch result.Outcome {
 			case OutcomeCorroborated:
@@ -901,21 +915,49 @@ func (state *CompactState) CompleteReview(input CompactReviewInput) error {
 				state.Outcomes[finding.ID] = result.Outcome
 				escalate = true
 			default:
-				return fmt.Errorf("unsupported refuter outcome %q", result.Outcome)
+				state.Outcomes[finding.ID] = OutcomeInconclusive
+				escalate = true
+				malformedErr = errors.Join(malformedErr, fmt.Errorf("unsupported refuter outcome %q", result.Outcome))
 			}
 		default:
-			return fmt.Errorf("unsupported evidence class %q", item.Class)
+			malformedErr = errors.Join(malformedErr, fmt.Errorf("unsupported evidence class %q", item.Class))
+			item.Class, item.Causality = EvidenceInsufficient, CausalUnknown
+			state.Classifications[finding.ID] = item
+			state.Outcomes[finding.ID] = OutcomeInconclusive
+			escalate = true
 		}
 	}
 	sort.Strings(state.FixFindingIDs)
-	if escalate {
+	allInconclusiveOnly := malformedErr == nil && compactAllSevereOutcomesInconclusive(*state)
+	if malformedErr != nil {
+		state.State = StateEscalated
+	} else if escalate && allInconclusiveOnly && input.DecisionRequiredEnabled {
+		state.State = StateDecisionRequired
+	} else if escalate {
 		state.State = StateEscalated
 	} else if len(state.FixFindingIDs) > 0 {
 		state.State = StateCorrectionRequired
 	} else {
 		state.State = StateValidating
 	}
-	return state.Validate()
+	if err := state.Validate(); err != nil {
+		return errors.Join(malformedErr, err)
+	}
+	return malformedErr
+}
+
+func compactAllSevereOutcomesInconclusive(state CompactState) bool {
+	severeCount := 0
+	for _, finding := range state.Findings {
+		if !isSevereSeverity(finding.Severity) {
+			continue
+		}
+		severeCount++
+		if state.Outcomes[finding.ID] != OutcomeInconclusive {
+			return false
+		}
+	}
+	return severeCount > 0
 }
 
 func findingLocationInGenesis(location string, genesisPaths []string) bool {
