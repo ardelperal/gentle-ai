@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/gentleman-programming/gentle-ai/v2/internal/agents"
@@ -1462,6 +1463,35 @@ func installSkillRegistryAutomation(homeDir string, adapter agents.Adapter) (Inj
 	return InjectionResult{Changed: changed, Files: []string{settingsPath}}, nil
 }
 
+// skillRegistryHookCommand returns the platform-specific skill-registry hook
+// command literal for the given agent and GOOS value. On Windows it emits a
+// PowerShell 5.1-compatible command; elsewhere it retains the POSIX form.
+// The command is non-blocking (explicit exit 0 on Windows; || true on POSIX).
+func skillRegistryHookCommand(agent, goos string) string {
+	if goos == "windows" {
+		// PowerShell 5.1-compatible: use $env: for env-var access and explicit
+		// exit 0 instead of POSIX || true. Inline the dir selection so the
+		// variable is in scope for the entire -Command argument.
+		// Use single quotes for -Command argument so PS doesn't re-parse the
+		// variable references when we pass the whole string as one argument.
+		return "powershell -NoProfile -Command 'if (Test-Path env:CLAUDE_PROJECT_DIR) { $dir = $env:CLAUDE_PROJECT_DIR } else { $dir = $PWD }; gentle-ai skill-registry refresh --quiet --no-gitignore --cwd $dir; exit 0'"
+	}
+	// POSIX: use $PWD and || true (works in bash/dash/zsh).
+	if agent == "claude" {
+		return `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" || true`
+	}
+	// Codex POSIX has no CLAUDE_PROJECT_DIR; use $PWD directly.
+	return `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "$PWD" || true`
+}
+
+// legacyCodexCommand is the POSIX literal written by gentle-ai < 2.2.5.
+// kept for exact-match detection in the dedup helpers.
+const legacyCodexCommand = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "$PWD" || true`
+
+// legacyClaudeCommand is the POSIX literal with ${VAR:-default} expansion written
+// by gentle-ai < 2.2.5.
+const legacyClaudeCommand = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" || true`
+
 func ensureCodexSkillRegistryHook(hooksPath string) (bool, error) {
 	root := map[string]any{}
 	if data, err := os.ReadFile(hooksPath); err == nil && len(strings.TrimSpace(string(data))) > 0 {
@@ -1472,7 +1502,7 @@ func ensureCodexSkillRegistryHook(hooksPath string) (bool, error) {
 		return false, err
 	}
 
-	const command = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "$PWD" || true`
+	command := skillRegistryHookCommand("codex", runtime.GOOS)
 	if claudeHookExists(root, command) {
 		return false, nil
 	}
@@ -1484,6 +1514,14 @@ func ensureCodexSkillRegistryHook(hooksPath string) (bool, error) {
 	}
 	if hooksMap == nil {
 		hooksMap = map[string]any{}
+	}
+
+	// Legacy upgrade: remove old POSIX literal before ensuring canonical.
+	// Only call hookListRemove when the key exists with a non-nil []any value.
+	// Assigning nil back would create an explicit nil map entry, causing
+	// hasSessionStart=true but sessionRaw.([]any)==nil on the next read.
+	if sessionRaw := hooksMap["SessionStart"]; sessionRaw != nil {
+		hooksMap["SessionStart"] = hookListRemove(sessionRaw, legacyCodexCommand)
 	}
 
 	sessionRaw, hasSessionStart := hooksMap["SessionStart"]
@@ -1530,7 +1568,7 @@ func ensureClaudeSkillRegistryHook(settingsPath string) (bool, error) {
 		return false, err
 	}
 
-	const command = `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" || true`
+	command := skillRegistryHookCommand("claude", runtime.GOOS)
 	if claudeHookExists(root, command) {
 		return false, nil
 	}
@@ -1543,6 +1581,18 @@ func ensureClaudeSkillRegistryHook(settingsPath string) (bool, error) {
 	if hooksMap == nil {
 		hooksMap = map[string]any{}
 	}
+
+	// Legacy upgrade: remove old POSIX literal before ensuring canonical.
+	// Only call hookListRemove when the key exists with a non-nil []any value.
+	// Only assign back if result is non-nil (something was actually filtered).
+	// Assigning nil would create an explicit nil map entry, causing
+	// hasUserPromptSubmit=true but userPromptSubmit=nil on the next read.
+	if promptRaw := hooksMap["UserPromptSubmit"]; promptRaw != nil {
+		if filtered := hookListRemove(promptRaw, legacyClaudeCommand); filtered != nil {
+			hooksMap["UserPromptSubmit"] = filtered
+		}
+	}
+
 	promptRaw, hasUserPromptSubmit := hooksMap["UserPromptSubmit"]
 	userPromptSubmit, _ := promptRaw.([]any)
 	if hasUserPromptSubmit && userPromptSubmit == nil {
@@ -1572,7 +1622,7 @@ func ensureClaudeSkillRegistryHook(settingsPath string) (bool, error) {
 	return wr.Changed, nil
 }
 
-func claudeHookExists(root map[string]any, command string) bool {
+func claudeHookExists(root map[string]any, commands ...string) bool {
 	hooksMap, ok := root["hooks"].(map[string]any)
 	if !ok {
 		return false
@@ -1582,7 +1632,7 @@ func claudeHookExists(root map[string]any, command string) bool {
 		if !ok {
 			continue
 		}
-		if claudeHookListContains(hookEntries, command) {
+		if hookListContains(hookEntries, commands...) {
 			return true
 		}
 	}
@@ -1607,6 +1657,72 @@ func claudeHookListContains(hookEntries []any, command string) bool {
 		}
 	}
 	return false
+}
+
+// hookListContains reports whether the hook-list ([]any, may be nil) contains
+// any of the given exact command strings. Used by the idempotency check.
+func hookListContains(hookEntries []any, commands ...string) bool {
+	for _, cmd := range commands {
+		if claudeHookListContains(hookEntries, cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+// hookListRemove accepts any (from a map[string]any index expression) and returns
+// a new []any with every hook entry whose command field equals any of the given
+// exact strings removed. Nil or non-[]any input yields nil unchanged.
+func hookListRemove(rawHookList any, commands ...string) []any {
+	hookEntries, ok := rawHookList.([]any)
+	if !ok || hookEntries == nil {
+		return nil // preserve absent-key semantics
+	}
+	if len(commands) == 0 {
+		return hookEntries
+	}
+	cmdSet := make(map[string]bool, len(commands))
+	for _, c := range commands {
+		cmdSet[c] = true
+	}
+	result := make([]any, 0, len(hookEntries))
+	for _, item := range hookEntries {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			result = append(result, item)
+			continue
+		}
+		hooks, ok := itemMap["hooks"].([]any)
+		if !ok {
+			result = append(result, item)
+			continue
+		}
+		newHooks := make([]any, 0, len(hooks))
+		for _, h := range hooks {
+			hMap, ok := h.(map[string]any)
+			if ok && cmdSet[hMap["command"].(string)] {
+				continue // skip command to remove
+			}
+			newHooks = append(newHooks, h)
+		}
+		if len(newHooks) == 0 {
+			continue // drop entry if all its hooks were removed
+		}
+		// Shallow-copy item and replace its hooks sub-list.
+		newItem := make(map[string]any, len(itemMap))
+		for k, v := range itemMap {
+			newItem[k] = v
+		}
+		newItem["hooks"] = newHooks
+		result = append(result, newItem)
+	}
+	if len(result) == 0 {
+		return []any{} // empty non-nil: key becomes []any{} (not nil),
+		// so subsequent reads don't get has=true/value=nil type-assertion failure.
+		// claudeHookExists must handle []any{} by returning false so we
+		// re-add the canonical hook on the next call.
+	}
+	return result
 }
 
 // ManagedOpenCodePluginNames lists every OpenCode plugin gentle-ai manages as

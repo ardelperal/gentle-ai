@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -6409,6 +6411,280 @@ func TestEnsureCodexSkillRegistryHookWritesSessionStartHookIdempotently(t *testi
 	}
 	if !strings.Contains(text, "echo keep") {
 		t.Fatalf("existing hooks not preserved:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Skill registry hook command cross-platform tests (T1)
+// ---------------------------------------------------------------------------
+
+// TestSkillRegistryHookCommandByPlatform verifies that the new helper produces
+// correct platform-specific literals for both agents and both OS families.
+func TestSkillRegistryHookCommandByPlatform(t *testing.T) {
+	tests := []struct {
+		agent string // "claude" or "codex"
+		goos  string // "windows" or "linux" / "darwin"
+	}{
+		{agent: "claude", goos: "windows"},
+		{agent: "claude", goos: "linux"},
+		{agent: "claude", goos: "darwin"},
+		{agent: "codex", goos: "windows"},
+		{agent: "codex", goos: "linux"},
+		{agent: "codex", goos: "darwin"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.agent+"/"+tt.goos, func(t *testing.T) {
+			cmd := skillRegistryHookCommand(tt.agent, tt.goos)
+			if cmd == "" {
+				t.Fatalf("skillRegistryHookCommand(%q, %q) returned empty string", tt.agent, tt.goos)
+			}
+			// All variants must invoke the skill-registry subcommand.
+			if !strings.Contains(cmd, "gentle-ai skill-registry refresh") {
+				t.Errorf("command does not invoke skill-registry refresh: %s", cmd)
+			}
+			// All variants must pass --cwd.
+			if !strings.Contains(cmd, "--cwd") {
+				t.Errorf("command does not pass --cwd: %s", cmd)
+			}
+			// Windows variant must use PowerShell syntax.
+			if tt.goos == "windows" {
+				if !strings.Contains(cmd, "powershell") {
+					t.Errorf("windows command does not use powershell: %s", cmd)
+				}
+				if strings.Contains(cmd, "${") {
+					t.Errorf("windows command must not use POSIX ${} parameter expansion: %s", cmd)
+				}
+				if strings.Contains(cmd, "|| true") {
+					t.Errorf("windows command must not use POSIX || true guard: %s", cmd)
+				}
+				// Must contain explicit exit 0, not || true.
+				// The command ends with '"', so HasSuffix("exit 0") would always fail.
+				if !strings.Contains(cmd, "exit 0") {
+					t.Errorf("windows command must contain exit 0: %s", cmd)
+				}
+			} else {
+				// POSIX must not embed PowerShell.
+				if strings.Contains(cmd, "powershell") {
+					t.Errorf("posix command must not use powershell: %s", cmd)
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureClaudeSkillRegistryHookWritesCrossPlatformCommand verifies that the
+// injected hook command matches the platform-specific helper output.
+func TestEnsureClaudeSkillRegistryHookWritesCrossPlatformCommand(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		t.Fatalf("ensureClaudeSkillRegistryHook() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("first call changed = false, want true")
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unmarshal and verify the written command via json comparison.
+	var gotRoot map[string]any
+	if err := json.Unmarshal(data, &gotRoot); err != nil {
+		t.Fatalf("settings.json is not valid JSON: %v", err)
+	}
+	hooks := gotRoot["hooks"].(map[string]any)
+	userPromptSubmit := hooks["UserPromptSubmit"].([]any)
+	entry := userPromptSubmit[0].(map[string]any)
+	hooksList := entry["hooks"].([]any)
+	cmdField := hooksList[0].(map[string]any)["command"].(string)
+
+	wantCmd := skillRegistryHookCommand("claude", runtime.GOOS)
+	if cmdField != wantCmd {
+		t.Errorf("command mismatch for GOOS=%s:\n  want: %s\n  got: %s", runtime.GOOS, wantCmd, cmdField)
+	}
+}
+
+// TestEnsureClaudeSkillRegistryHookReplacesLegacyCommand verifies that an
+// existing settings.json containing the legacy POSIX command is updated to
+// the canonical form without duplication.
+func TestEnsureClaudeSkillRegistryHookReplacesLegacyCommand(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy POSIX command that the old inject wrote.
+	legacyCmd := `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" || true`
+	settingsWithLegacy := fmt.Sprintf(`{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {"type": "command", "command": %q}
+        ]
+      }
+    ]
+  }
+}`, legacyCmd)
+	if err := os.WriteFile(settingsPath, []byte(settingsWithLegacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		t.Fatalf("ensureClaudeSkillRegistryHook() with legacy entry error = %v", err)
+	}
+	// On POSIX hosts the legacy literal is byte-identical to the canonical
+	// one (both are the bash form), so the dedup helper short-circuits and
+	// returns changed=false. On Windows the legacy bash literal differs from
+	// the canonical PowerShell literal, so the sweep removes the legacy and
+	// writes the canonical (changed=true). The contract is the same in both
+	// cases — no duplicate, exactly one canonical entry.
+	wantCmd := skillRegistryHookCommand("claude", runtime.GOOS)
+	wantChanged := legacyCmd != wantCmd
+	if changed != wantChanged {
+		t.Fatalf("upgrade from legacy command: changed = %v, want %v (legacy %q vs canonical %q)", changed, wantChanged, legacyCmd, wantCmd)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify: exactly one hook entry with the canonical command, no legacy.
+	var gotRoot map[string]any
+	if err := json.Unmarshal(data, &gotRoot); err != nil {
+		t.Fatalf("settings.json is not valid JSON after upgrade: %v", err)
+	}
+	hooks := gotRoot["hooks"].(map[string]any)
+	userPromptSubmit := hooks["UserPromptSubmit"].([]any)
+	if len(userPromptSubmit) != 1 {
+		t.Errorf("want 1 hook entry, got %d: %v", len(userPromptSubmit), userPromptSubmit)
+	}
+	entry := userPromptSubmit[0].(map[string]any)
+	hooksList := entry["hooks"].([]any)
+	cmdField := hooksList[0].(map[string]any)["command"].(string)
+	if cmdField != wantCmd {
+		t.Errorf("command mismatch after legacy upgrade:\n  want: %s\n  got: %s", wantCmd, cmdField)
+	}
+}
+
+// TestEnsureCodexSkillRegistryHookReplacesLegacyCommand verifies that an
+// existing hooks.json containing the legacy POSIX command is updated to
+// the canonical form without duplication.
+func TestEnsureCodexSkillRegistryHookReplacesLegacyCommand(t *testing.T) {
+	home := t.TempDir()
+	hooksPath := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy POSIX command that the old inject wrote.
+	legacyCmd := `gentle-ai skill-registry refresh --quiet --no-gitignore --cwd "$PWD" || true`
+	hooksWithLegacy := fmt.Sprintf(`{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {"type": "command", "command": %q, "timeout": 30, "statusMessage": "Refreshing skill registry"}
+        ]
+      }
+    ]
+  }
+}`, legacyCmd)
+	if err := os.WriteFile(hooksPath, []byte(hooksWithLegacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureCodexSkillRegistryHook(hooksPath)
+	if err != nil {
+		t.Fatalf("ensureCodexSkillRegistryHook() with legacy entry error = %v", err)
+	}
+	// See the equivalent Claude test above for the POSIX-vs-Windows rationale
+	// behind the conditional changed expectation.
+	wantCmd := skillRegistryHookCommand("codex", runtime.GOOS)
+	wantChanged := legacyCmd != wantCmd
+	if changed != wantChanged {
+		t.Fatalf("upgrade from legacy command: changed = %v, want %v (legacy %q vs canonical %q)", changed, wantChanged, legacyCmd, wantCmd)
+	}
+
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify: exactly one hook entry with the canonical command, no legacy.
+	var gotRoot map[string]any
+	if err := json.Unmarshal(data, &gotRoot); err != nil {
+		t.Fatalf("hooks.json is not valid JSON after upgrade: %v", err)
+	}
+	hooks := gotRoot["hooks"].(map[string]any)
+	sessionStart := hooks["SessionStart"].([]any)
+	if len(sessionStart) != 1 {
+		t.Errorf("want 1 hook entry, got %d: %v", len(sessionStart), sessionStart)
+	}
+	entry := sessionStart[0].(map[string]any)
+	hooksList := entry["hooks"].([]any)
+	cmdField := hooksList[0].(map[string]any)["command"].(string)
+	if cmdField != wantCmd {
+		t.Errorf("command mismatch after legacy upgrade:\n  want: %s\n  got: %s", wantCmd, cmdField)
+	}
+}
+
+// extractCommandSnippet returns a short string around the first skill-registry
+// command found in jsonText for error messages.
+func extractCommandSnippet(jsonText string) string {
+	idx := strings.Index(jsonText, "gentle-ai skill-registry refresh")
+	if idx < 0 {
+		return "(command not found in text)"
+	}
+	start := idx - 20
+	if start < 0 {
+		start = 0
+	}
+	end := idx + 80
+	if end > len(jsonText) {
+		end = len(jsonText)
+	}
+	return jsonText[start:end]
+}
+
+// TestSkillRegistryHookCommandRunsUnderWindowsPowerShell51 is gated on
+// runtime.GOOS == "windows". It validates that the generated PowerShell
+// command literal is syntactically valid under Windows PowerShell 5.1 by
+// invoking it with -WhatIf (which parses the command without executing it).
+// This reproduces issue #2124: the legacy POSIX || true guard causes PowerShell
+// to fail because || is not a valid token in PS 5.1.
+func TestSkillRegistryHookCommandRunsUnderWindowsPowerShell51(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only test")
+	}
+
+	cmd := skillRegistryHookCommand("claude", "windows")
+	if cmd == "" {
+		t.Fatal("skillRegistryHookCommand returned empty")
+	}
+
+	// Verify the PowerShell command string is syntactically valid by asking
+	// PowerShell to parse it with [scriptblock]::Create (no execution).
+	// This validates the if/else structure, variable references, and semicolon
+	// chain without running the gentle-ai subprocess.
+	psCmd := fmt.Sprintf("[scriptblock]::Create(%q) | Out-Null; exit 0", cmd)
+	var stderr bytes.Buffer
+	proc := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
+	proc.Stderr = &stderr
+	runErr := proc.Run()
+	if runErr != nil {
+		t.Fatalf("PowerShell parse error (exit %v): %s\ncommand was: %s", runErr, stderr.String(), cmd)
 	}
 }
 
