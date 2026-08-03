@@ -6578,6 +6578,90 @@ func TestEnsureClaudeSkillRegistryHookReplacesLegacyCommand(t *testing.T) {
 	}
 }
 
+// TestEnsureClaudeSkillRegistryHookHandlesMalformedEntry verifies that
+// settings.json containing a hook entry that lacks the inner `command`
+// string field (e.g. a 3rd-party tool emitting only `{"type": "command"}`)
+// does not panic during the legacy-replacement sweep. The malformed entry
+// must be preserved untouched and the canonical hook must still be appended.
+//
+// This boundary case is intentionally isolated as a follow-up to the core
+// platform-aware fix (PR A); it captures the precise panic reproducer
+// discovered in fresh-context review.
+func TestEnsureClaudeSkillRegistryHookHandlesMalformedEntry(t *testing.T) {
+	home := t.TempDir()
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Malformed entry — a 3rd-party tool emitting only the type, no command.
+	const malformed = `{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {"type": "command"}
+        ]
+      }
+    ]
+  }
+}`
+	if err := os.WriteFile(settingsPath, []byte(malformed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Must not panic.
+	changed, err := ensureClaudeSkillRegistryHook(settingsPath)
+	if err != nil {
+		t.Fatalf("ensureClaudeSkillRegistryHook() with malformed entry error = %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true (canonical hook should have been appended)")
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotRoot map[string]any
+	if err := json.Unmarshal(data, &gotRoot); err != nil {
+		t.Fatalf("settings.json is not valid JSON after upgrade: %v", err)
+	}
+	hooks := gotRoot["hooks"].(map[string]any)
+	userPromptSubmit := hooks["UserPromptSubmit"].([]any)
+	if len(userPromptSubmit) != 2 {
+		t.Fatalf("want 2 UserPromptSubmit entries (malformed + canonical), got %d: %v", len(userPromptSubmit), userPromptSubmit)
+	}
+	// The canonical entry must appear with the platform-aware command.
+	wantCmd := skillRegistryHookCommand("claude", runtime.GOOS)
+	var found bool
+	for _, raw := range userPromptSubmit {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		hookList, ok := entry["hooks"].([]any)
+		if !ok || len(hookList) == 0 {
+			continue
+		}
+		first, ok := hookList[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		cmdStr, ok := first["command"].(string)
+		if !ok {
+			continue
+		}
+		if cmdStr == wantCmd {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("canonical command %q not found in any hook entry after malformed-entry upgrade", wantCmd)
+	}
+}
+
 // TestEnsureCodexSkillRegistryHookReplacesLegacyCommand verifies that an
 // existing hooks.json containing the legacy POSIX command is updated to
 // the canonical form without duplication.

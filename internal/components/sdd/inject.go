@@ -1700,7 +1700,12 @@ func hookListRemove(rawHookList any, commands ...string) []any {
 		newHooks := make([]any, 0, len(hooks))
 		for _, h := range hooks {
 			hMap, ok := h.(map[string]any)
-			if ok && cmdSet[hMap["command"].(string)] {
+			if !ok {
+				newHooks = append(newHooks, h)
+				continue
+			}
+			cmdStr, okCmd := hMap["command"].(string)
+			if okCmd && cmdSet[cmdStr] {
 				continue // skip command to remove
 			}
 			newHooks = append(newHooks, h)
