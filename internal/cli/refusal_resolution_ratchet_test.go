@@ -632,3 +632,62 @@ func refusalRatchetLiteralString(expr ast.Expr) (string, bool) {
 	}
 	return "", false
 }
+
+// TestMarkdownByDesignEnvelopeParsing: the asset walker's four shapes on synthetic markdown.
+func TestMarkdownByDesignEnvelopeParsing(t *testing.T) {
+	t.Run("named continuation in a bullet satisfies", func(t *testing.T) {
+		source := "# Workflow\n\n- If blocked, run `gentle-ai review mode status` to inspect.\n"
+		envs, err := ParseMarkdownByDesignEnvelope(source)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(envs) != 1 || envs[0].Verb != "mode" {
+			t.Fatalf("want 1 envelope naming mode, got %+v", envs)
+		}
+	})
+	t.Run("by-design marker in a comment satisfies", func(t *testing.T) {
+		source := "# Workflow\n\n<!-- by-design: world-action -->\nSome prose.\n"
+		envs, err := ParseMarkdownByDesignEnvelope(source)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(envs) != 1 || envs[0].Shape != byDesignWorldAction {
+			t.Fatalf("want 1 envelope with shape=world-action, got %+v", envs)
+		}
+	})
+	t.Run("prose without marker or verb is skipped", func(t *testing.T) {
+		source := "# Heading\n\nSome prose that mentions gentle-ai in passing.\n"
+		envs, err := ParseMarkdownByDesignEnvelope(source)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(envs) != 0 {
+			t.Fatalf("want 0 envelopes for prose-only input, got %+v", envs)
+		}
+	})
+	t.Run("dispatched review verb passes the resolver", func(t *testing.T) {
+		source := "- Run `gentle-ai review reopen-results` to recover.\n"
+		envs, err := ParseMarkdownByDesignEnvelope(source)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(envs) != 1 || envs[0].Verb != "reopen-results" {
+			t.Fatalf("want 1 envelope naming reopen-results, got %+v", envs)
+		}
+	})
+}
+
+// TestMarkdownByDesignEnvelopeFailsClosedOnSyntheticVerb: the Drift #1 guarantee -- a verb the CLI does not dispatch must fail the entire parse closed.
+func TestMarkdownByDesignEnvelopeFailsClosedOnSyntheticVerb(t *testing.T) {
+	source := "# Workflow\n\n- Run `gentle-ai review nonexistent-verb` to recover.\n"
+	_, err := ParseMarkdownByDesignEnvelope(source)
+	if err == nil {
+		t.Fatal("want fail-closed error for non-dispatching verb; got nil")
+	}
+	if !strings.Contains(err.Error(), "nonexistent-verb") {
+		t.Fatalf("want error mentioning the synthetic verb, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ReviewDispatchableReviewVerbs") {
+		t.Fatalf("want error mentioning the resolver, got %v", err)
+	}
+}
