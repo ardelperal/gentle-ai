@@ -18,6 +18,7 @@ j11-unborn-head
 j12-rejected-capture-then-recapture
 j13-next-transition-runs-verbatim
 j14-abandon-needs-a-hand-built-token
+j1471-create-only-reviewed-tracker-bootstrap
 j15-linked-worktree
 j16-detached-head
 j17-bare-repository

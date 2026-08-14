@@ -139,6 +139,7 @@ type reviewRefPublicationRequest struct {
 	Actor                     string
 	Reason                    string
 	MaintainerAuthorization   string
+	Cwd                       string
 }
 
 // reviewRefPublicationRequireValidRequest is the single preflight guard
@@ -332,6 +333,7 @@ func reviewRefPublicationParseFlags(
 	actor := flags.String("actor", "", "maintainer actor; never echoed in public output")
 	reason := flags.String("reason", "", "maintainer reason; never echoed in public output")
 	flags.String("maintainer-authorization", "", "exact 14-line LF-only maintainer authorization")
+	cwd := flags.String("cwd", ".", "repository path")
 	if err := parseReviewFlags(flags, args); err != nil {
 		return reviewRefPublicationRequest{}, err
 	}
@@ -354,6 +356,7 @@ func reviewRefPublicationParseFlags(
 		Actor:                     strings.TrimSpace(*actor),
 		Reason:                    strings.TrimSpace(*reason),
 		MaintainerAuthorization:   flags.Lookup("maintainer-authorization").Value.String(),
+		Cwd:                       strings.TrimSpace(*cwd),
 	}, nil
 }
 
@@ -365,21 +368,21 @@ func reviewRefPublicationReadOnlyFlags(
 	stdout io.Writer,
 	help string,
 	args []string,
-) (string, error) {
+) (string, string, error) {
 	flags := newReviewFlagSet(name, stdout, help)
 	requestID := flags.String("request-id", "", "exact request UUID whose durable record is the read source")
-	flags.String("cwd", ".", "repository path")
+	cwd := flags.String("cwd", ".", "repository path")
 	if err := parseReviewFlags(flags, args); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if reviewHelpRequested(args) {
-		return "", nil
+		return "", "", nil
 	}
 	if flags.NArg() != 0 {
-		return "", reviewRefPublicationErrInvalidRequest(
+		return "", "", reviewRefPublicationErrInvalidRequest(
 			"review " + name + " received an unexpected positional argument: " + flags.Arg(0))
 	}
-	return strings.TrimSpace(*requestID), nil
+	return strings.TrimSpace(*requestID), strings.TrimSpace(*cwd), nil
 }
 
 // reviewRefPublicationEncodeEnvelope is the bounded JSON-encode helper. It
@@ -717,7 +720,7 @@ func RunReviewPublishRef(args []string, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reviewRefPublicationOperationTimeout)
 	defer cancel()
-	root, err := reviewRefPublicationResolveRoot(ctx, ".")
+	root, err := reviewRefPublicationResolveRoot(ctx, request.Cwd)
 	if err != nil {
 		return reviewRefPublicationEmitInvalidRequest(err)
 	}
@@ -753,7 +756,7 @@ const reviewRefPublicationOperationTimeout = 120 * time.Second
 // unknown request_id exits 1 so callers can branch on the durable
 // identity without re-reading the on-disk state.
 func RunReviewPublishRefStatus(args []string, stdout io.Writer) error {
-	requestID, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", stdout,
+	requestID, cwd, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", stdout,
 		"Read the durable ref publication record for one request_id. Returns the gentle-ai.review-ref-publication-status/v1 envelope with the current attempt state, attribution, updated_at, and result_ref. Exits 0 if the record is present; exits 1 if the request_id is unknown. Never pushes.",
 		args)
 	if err != nil {
@@ -767,7 +770,7 @@ func RunReviewPublishRefStatus(args []string, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reviewRefPublicationOperationTimeout)
 	defer cancel()
-	root, err := reviewRefPublicationResolveRoot(ctx, ".")
+	root, err := reviewRefPublicationResolveRoot(ctx, cwd)
 	if err != nil {
 		return reviewRefPublicationEmitInvalidRequest(err)
 	}
@@ -808,7 +811,7 @@ func RunReviewPublishRefStatus(args []string, stdout io.Writer) error {
 // and classifies the destination as not_created, confirmed, conflict, or
 // publication_unknown. The dispatch never pushes.
 func RunReviewPublishRefReconcile(args []string, stdout io.Writer) error {
-	requestID, err := reviewRefPublicationReadOnlyFlags("review publish-ref-reconcile", stdout,
+	requestID, cwd, err := reviewRefPublicationReadOnlyFlags("review publish-ref-reconcile", stdout,
 		"Refresh the ref publication verdict from a fresh isolated remote observation. Returns the gentle-ai.review-ref-publication-reconciliation/v1 envelope with the classification and the observed commit. Exits 0 on confirmed, 1 on not_created/conflict, 75 on publication_unknown, 2 on invalid_request. Never pushes.",
 		args)
 	if err != nil {
@@ -822,7 +825,7 @@ func RunReviewPublishRefReconcile(args []string, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reviewRefPublicationOperationTimeout)
 	defer cancel()
-	root, err := reviewRefPublicationResolveRoot(ctx, ".")
+	root, err := reviewRefPublicationResolveRoot(ctx, cwd)
 	if err != nil {
 		return reviewRefPublicationEmitInvalidRequest(err)
 	}

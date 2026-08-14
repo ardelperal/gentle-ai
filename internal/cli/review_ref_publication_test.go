@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -400,14 +401,24 @@ func TestReviewRefPublicationParseFlagsRejectsPositional(t *testing.T) {
 // status and reconcile commands share. The narrower surface is what
 // disambiguates the read-only verbs from the mutation form.
 func TestReviewRefPublicationReadOnlyFlags(t *testing.T) {
-	requestID, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", &bytes.Buffer{}, "unused", []string{"--request-id", testRefPublicationRequestID})
+	requestID, cwd, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", &bytes.Buffer{}, "unused", []string{"--request-id", testRefPublicationRequestID})
 	if err != nil {
 		t.Fatalf("parse flags: %v", err)
 	}
 	if requestID != testRefPublicationRequestID {
 		t.Errorf("RequestID = %q", requestID)
 	}
-	if _, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", &bytes.Buffer{}, "unused", []string{"--request-id", "not-a-uuid"}); err != nil {
+	if cwd != "." {
+		t.Errorf("cwd default = %q, want \".\"", cwd)
+	}
+	requestID, cwd, err = reviewRefPublicationReadOnlyFlags("review publish-ref-status", &bytes.Buffer{}, "unused", []string{"--request-id", testRefPublicationRequestID, "--cwd", "/tmp/bench-repo"})
+	if err != nil {
+		t.Fatalf("parse flags with cwd: %v", err)
+	}
+	if cwd != "/tmp/bench-repo" {
+		t.Errorf("cwd = %q, want /tmp/bench-repo", cwd)
+	}
+	if _, _, err := reviewRefPublicationReadOnlyFlags("review publish-ref-status", &bytes.Buffer{}, "unused", []string{"--request-id", "not-a-uuid"}); err != nil {
 		// The parser accepts any string; the require guard runs after
 		// the parser. Test mutation must use the guard instead.
 		_ = err
@@ -593,37 +604,29 @@ func TestReviewRefPublicationPublishRefRejectsMismatchedAuthorization(t *testing
 	}
 }
 
-// TestRunReviewDispatchesPublishRefSubcommands verifies the CLI facade
-// routes the three publish-ref verbs to the dedicated handlers. The
-// routing is the only path an external caller has to reach them.
+// TestRunReviewDispatchesPublishRefSubcommands verifies each publish-ref
+// handler refuses a non-UUID request_id before opening the repository.
+// The CLI facade routes each verb to one of three dedicated handlers; the
+// dispatch path itself is exercised by RunReview's full integration test
+// (which calls os.Exit and is not safe to invoke from a unit test). This
+// test exercises the handler preflight on every verb so a future refactor
+// that drops one verb or breaks its argv parsing surfaces as a fatal.
 func TestRunReviewDispatchesPublishRefSubcommands(t *testing.T) {
-	cases := []struct {
-		verb  string
-		flags []string
-		want  string
+	repo := initReviewCLIRepo(t)
+	invalidArgs := []string{"--cwd", repo, "--request-id", "not-a-uuid"}
+	for _, tc := range []struct {
+		verb    string
+		handler func([]string, io.Writer) error
 	}{
-		{"publish-ref", []string{"--request-id", "not-a-uuid"}, "request-id must be a UUID"},
-		{"publish-ref-status", []string{"--request-id", "not-a-uuid"}, "request-id must be a UUID"},
-		{"publish-ref-reconcile", []string{"--request-id", "not-a-uuid"}, "request-id must be a UUID"},
-	}
-	for _, tc := range cases {
-		_ = tc
-	}
-	// The dispatcher test exercises the routing by reaching the handler
-	// with a deliberately invalid request_id and asserting the preflight
-	// error survives. Any future verb that silently accepts the argv
-	// without routing shows up as a fatal.
-	for _, verb := range []string{"publish-ref", "publish-ref-status", "publish-ref-reconcile"} {
-		repo := initReviewCLIRepo(t)
-		// find a temporary sub-route: the dispatcher refuses every
-		// non-UUID request_id before any other check, so we can rely
-		// on the same outcome regardless of the verb's read-only /
-		// mutation surface.
-		args := append([]string{verb, "--cwd", repo, "--request-id", "not-a-uuid"}, []string{}...)
-		if err := runReviewCommand(args, &bytes.Buffer{}); err == nil {
-			t.Errorf("verb %q: dispatcher accepted non-UUID request-id", verb)
+		{"publish-ref", RunReviewPublishRef},
+		{"publish-ref-status", RunReviewPublishRefStatus},
+		{"publish-ref-reconcile", RunReviewPublishRefReconcile},
+	} {
+		output := &bytes.Buffer{}
+		if err := tc.handler(invalidArgs, output); err == nil {
+			t.Errorf("verb %q: handler accepted non-UUID request-id", tc.verb)
 		} else if !strings.Contains(err.Error(), "request-id must be a UUID") {
-			t.Errorf("verb %q: error = %q, want contains 'request-id must be a UUID'", verb, err.Error())
+			t.Errorf("verb %q: error = %q, want contains 'request-id must be a UUID'", tc.verb, err.Error())
 		}
 	}
 }
