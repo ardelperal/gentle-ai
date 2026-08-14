@@ -583,19 +583,18 @@ func reviewRefPublicationDispatchLifecycle(
 	if err != nil {
 		return reviewRefPublicationLifecycleErrorFrom(err)
 	}
-	if _, err := transport.Prepare(ctx, auth, persisted); err != nil {
+	if err := transport.Prepare(ctx, auth, persisted); err != nil {
 		return reviewRefPublicationLifecycleErrorFrom(err)
+	}
+	pushResult, pushErr := transport.Push(ctx, persisted)
+	if pushErr != nil {
+		return reviewRefPublicationLifecycleErrorFrom(pushErr)
 	}
 	pushedRecord := persisted
 	pushedRecord.State = reviewtransaction.RefPubPushed
 	pushedRecord.UpdatedAt = reviewRefPublicationCurrentTimestamp()
-	pushed, err := repository.Save(ctx, pushedRecord)
-	if err != nil {
+	if _, err := repository.Save(ctx, pushedRecord); err != nil {
 		return reviewRefPublicationLifecycleErrorFrom(err)
-	}
-	pushResult, pushErr := transport.Push(ctx, pushed)
-	if pushErr != nil {
-		return reviewRefPublicationLifecycleErrorFrom(pushErr)
 	}
 	confirmedAt := reviewRefPublicationCurrentTimestamp()
 	_ = pushResult

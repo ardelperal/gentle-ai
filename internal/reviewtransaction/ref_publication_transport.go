@@ -2,14 +2,13 @@ package reviewtransaction
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 )
@@ -18,8 +17,6 @@ const (
 	refPublicationTransportsDirectory = "transports"
 	refPublicationTransportGitName    = "transport.git"
 	refPublicationTransportAlternates = "objects/info/alternates"
-	refPublicationTransportPushMark   = "push-completed"
-	refPublicationTransportPushLog    = "push.log"
 	refPublicationTransportMaxStdout  = 1 << 20
 	refPublicationTransportMaxStderr  = 64 << 10
 	refPublicationTransportPushWait   = 90 * time.Second
@@ -65,37 +62,6 @@ var (
 	// push. The one-use authorization budget forbids dispatching again.
 	ErrRefPublicationTransportAlreadyTerminal = errors.New("ref publication transport has already executed its single push")
 )
-
-// refPublicationTransportHandleSchema is the durable bind between the
-// prepared record and the on-disk isolated transport. It is persisted as a
-// sidecar so the read-only reconcile path can recover the transport
-// metadata without re-deriving it.
-const refPublicationTransportHandleSchema = "gentle-ai.review-ref-publication-transport-handle/v1"
-
-type refPublicationTransportHandleRecord struct {
-	Schema        string                      `json:"schema"`
-	RequestID     string                      `json:"request_id"`
-	RequestDigest string                      `json:"request_digest"`
-	TransportPath string                      `json:"transport_path"`
-	Authorization RefPublicationAuthorization `json:"authorization"`
-	CreatedAt     string                      `json:"created_at"`
-}
-
-func (handle refPublicationTransportHandleRecord) Validate() error {
-	if handle.Schema != refPublicationTransportHandleSchema {
-		return errors.New("ref publication transport handle schema is invalid")
-	}
-	if handle.RequestID == "" || !validSHA256(handle.RequestDigest) {
-		return errors.New("ref publication transport handle request binding is invalid")
-	}
-	if strings.TrimSpace(handle.TransportPath) == "" {
-		return errors.New("ref publication transport path is empty")
-	}
-	if err := handle.Authorization.Validate(); err != nil {
-		return fmt.Errorf("ref publication transport authorization: %w", err)
-	}
-	return nil
-}
 
 var (
 	porcelainHeaderLine = regexp.MustCompile(`^To (?P<url>[!-~\x20]+)$`)
@@ -163,16 +129,6 @@ func (transport *RarRefPublicationTransport) transportPath(
 	)
 }
 
-func (transport *RarRefPublicationTransport) handlePath(
-	requestID, requestDigest string,
-) string {
-	return filepath.Join(
-		transport.TransportRoot(),
-		requestID,
-		"handle.json",
-	)
-}
-
 // Prepare builds the isolated bare transport and persists the prepared record
 // under the supplied authorization. The same request_id may only be replayed
 // with the identical request_digest.
@@ -180,109 +136,56 @@ func (transport *RarRefPublicationTransport) Prepare(
 	ctx context.Context,
 	auth RefPublicationAuthorization,
 	record RefPublicationRecord,
-) (RefPublicationTransportHandleRecord, error) {
+) error {
 	if err := ctx.Err(); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if transport == nil || transport.repo == nil {
-		return RefPublicationTransportHandleRecord{}, errors.New("ref publication transport is not initialized")
+		return errors.New("ref publication transport is not initialized")
 	}
 	if err := auth.Validate(); err != nil {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf("ref publication authorization: %w", err)
+		return fmt.Errorf("ref publication authorization: %w", err)
 	}
 	if record.RequestID != auth.RequestID {
-		return RefPublicationTransportHandleRecord{}, errors.New("ref publication record request_id does not match authorization")
+		return errors.New("ref publication record request_id does not match authorization")
 	}
 	if record.State != RefPubPrepared && record.State != RefPubPushed {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf(
+		return fmt.Errorf(
 			"%w: prepare requires prepared or pushed state; got %q",
 			ErrRefPublicationTransitionIllegal, record.State,
 		)
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := ensureRARRepositoryRoot(transport.repo.rar.identity.GitCommonDir, transport.repo.rar.root, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := ensurePrivateRARDirectoryTree(transport.repo.rar.root, transport.repo.rar.root, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	parent := filepath.Dir(transport.transportPath(auth.RequestID, auth.RequestDigest))
 	if err := ensurePrivateRARDirectoryTree(transport.repo.rar.root, parent, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	path := transport.transportPath(auth.RequestID, auth.RequestDigest)
 	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
 		if err := transport.initBareTransport(ctx, path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 		if err := transport.bindAlternates(path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
-		}
-		if err := transport.clearPushMark(path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 		if err := SyncReviewDirectory(filepath.Dir(path)); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 	} else if err != nil {
-		return RefPublicationTransportHandleRecord{}, err
-	}
-	if existing, err := transport.loadHandleForRequestID(auth.RequestID); err == nil {
-		if existing.RequestDigest != auth.RequestDigest {
-			return RefPublicationTransportHandleRecord{}, fmt.Errorf(
-				"%w: request_id=%s", ErrRefPublicationReplayMismatch, auth.RequestID,
-			)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return RefPublicationTransportHandleRecord{}, err
-	}
-	handle := refPublicationTransportHandleRecord{
-		Schema:        refPublicationTransportHandleSchema,
-		RequestID:     auth.RequestID,
-		RequestDigest: auth.RequestDigest,
-		TransportPath: path,
-		Authorization: auth,
-		CreatedAt:     record.UpdatedAt,
-	}
-	payload, err := json.Marshal(handle)
-	if err != nil {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf("encode ref publication transport handle: %w", err)
-	}
-	if err := writePrivateRecordFile(transport.handlePath(auth.RequestID, auth.RequestDigest), payload); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
-	return RefPublicationTransportHandleRecord{
-		Handle: handle,
-	}, nil
-}
-
-// loadHandleForRequestID re-reads the durable handle for a request_id. The
-// handle stores the exact request_digest bound when the handle was written;
-// a mismatch means a different authorization is being replayed under the
-// same request_id and Prepare must refuse.
-func (transport *RarRefPublicationTransport) loadHandleForRequestID(
-	requestID string,
-) (refPublicationTransportHandleRecord, error) {
-	payload, err := readPrivateRARFile(transport.handlePath(requestID, ""))
-	if err != nil {
-		return refPublicationTransportHandleRecord{}, err
-	}
-	var handle refPublicationTransportHandleRecord
-	if err := json.Unmarshal(payload, &handle); err != nil {
-		return refPublicationTransportHandleRecord{}, fmt.Errorf("parse ref publication transport handle: %w", err)
-	}
-	if handle.RequestID != requestID {
-		return refPublicationTransportHandleRecord{}, errors.New("ref publication transport handle request_id mismatch")
-	}
-	if err := handle.Validate(); err != nil {
-		return refPublicationTransportHandleRecord{}, err
-	}
-	return handle, nil
+	return nil
 }
 
 // initBareTransport creates the fresh empty private bare repo on disk. The
@@ -328,45 +231,14 @@ func (transport *RarRefPublicationTransport) bindAlternates(path string) error {
 	return nil
 }
 
-// clearPushMark removes the push-completed marker from a freshly-prepared
-// transport so the sole push can dispatch on the first call. Prepare is
-// always called against the absence of an executed push.
-func (transport *RarRefPublicationTransport) clearPushMark(path string) error {
-	mark := filepath.Join(path, refPublicationTransportPushMark)
-	if _, err := os.Lstat(mark); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return os.Remove(mark)
-}
-
-// markPushCompleted records that the prepared transport has dispatched
-// its sole successful push. Subsequent Push calls see this marker and are
-// rejected with ErrRefPublicationTransportAlreadyTerminal.
-func (transport *RarRefPublicationTransport) markPushCompleted(
-	path string,
-) error {
-	dir := filepath.Join(path, "refs", "heads")
-	if err := ensurePrivateRARDirectoryTree(path, dir, true); err != nil {
-		return err
-	}
-	if err := writePrivateRecordFile(
-		filepath.Join(path, refPublicationTransportPushMark),
-		[]byte(strconv.FormatInt(time.Now().UnixNano(), 10)),
-	); err != nil {
-		return err
-	}
-	if _, err := os.Lstat(filepath.Join(path, refPublicationTransportPushLog)); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	return SyncReviewDirectory(filepath.Dir(filepath.Join(path, refPublicationTransportPushLog)))
-}
-
 // Push executes the strictly sandboxed git push and parses its porcelain
 // output. The single attribution signal is one successful [new branch]
 // record for C -> refs/heads/<N>, with no other records, no rejections, and
 // empty stderr. Anything else yields a typed error.
+//
+// The state machine (Prepared → Pushed) is the only "already pushed"
+// detector: a second call with state already RefPubPushed is rejected with
+// ErrRefPublicationTransportAlreadyTerminal.
 func (transport *RarRefPublicationTransport) Push(
 	ctx context.Context,
 	record RefPublicationRecord,
@@ -377,9 +249,12 @@ func (transport *RarRefPublicationTransport) Push(
 	if transport == nil || transport.repo == nil {
 		return RefPublicationPushResult{}, errors.New("ref publication transport is not initialized")
 	}
-	if record.State != RefPubPrepared && record.State != RefPubPushed {
+	if record.State == RefPubPushed {
+		return RefPublicationPushResult{}, ErrRefPublicationTransportAlreadyTerminal
+	}
+	if record.State != RefPubPrepared {
 		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: push requires prepared or pushed state; got %q",
+			"%w: push requires prepared state; got %q",
 			ErrRefPublicationTransitionIllegal, record.State,
 		)
 	}
@@ -400,12 +275,6 @@ func (transport *RarRefPublicationTransport) Push(
 	if err := validatePrivateRARDirectory(path); err != nil {
 		return RefPublicationPushResult{}, err
 	}
-	markPath := filepath.Join(path, refPublicationTransportPushMark)
-	if _, err := os.Lstat(markPath); err == nil {
-		return RefPublicationPushResult{}, ErrRefPublicationTransportAlreadyTerminal
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return RefPublicationPushResult{}, err
-	}
 	argv, env, err := transport.buildPushCommandEnv(auth, path)
 	if err != nil {
 		return RefPublicationPushResult{}, err
@@ -416,30 +285,12 @@ func (transport *RarRefPublicationTransport) Push(
 		if len(stderr) != 0 && ctx.Err() == nil && isLeaseRejection(stderr, parseErr) {
 			return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, parseErr)
 		}
-		if attribution.ServerStderr == "" {
-			attribution.ServerStderr = strings.TrimSpace(string(stderr))
-		}
 		return RefPublicationPushResult{}, parseErr
 	}
 	if runErr != nil {
 		return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationTransportCrashed, runErr)
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationPushResult{}, err
-	}
-	if attribution.SourceCommit != auth.SourceCommit {
-		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: porcelain from=%s does not match authorized source_commit=%s",
-			ErrRefPublicationDriftRejected, attribution.SourceCommit, auth.SourceCommit,
-		)
-	}
-	if attribution.Destination != auth.DestinationRef {
-		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: porcelain to=%s does not match authorized destination_ref=%s",
-			ErrRefPublicationDriftRejected, attribution.Destination, auth.DestinationRef,
-		)
-	}
-	if err := transport.markPushCompleted(path); err != nil {
 		return RefPublicationPushResult{}, err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
@@ -664,26 +515,13 @@ func (transport *RarRefPublicationTransport) Reconcile(
 	}, nil
 }
 
-// RefPublicationTransportHandleRecord is the typed return value of Prepare.
-type RefPublicationTransportHandleRecord struct {
-	Handle refPublicationTransportHandleRecord
-}
-
 // RefPublicationPushResult is the typed attribution verdict for the single
 // push attempt. A successful Push returns Result with Classification set
-// to AttributionProven; any other condition is returned as a typed error
-// instead.
+// to AttributionProven and State set to RefPubPushed; any other condition
+// is returned as a typed error instead.
 type RefPublicationPushResult struct {
 	Classification RefPublicationAttribution `json:"classification"`
-	Destination    string                    `json:"destination"`
-	SourceCommit   string                    `json:"source_commit"`
-	FromHash       string                    `json:"from_hash"`
-	ToRef          string                    `json:"to_ref"`
-	Reason         string                    `json:"reason"`
-	ServerStderr   string                    `json:"server_stderr"`
-	UsedEndpoint   string                    `json:"used_endpoint"`
-	UsedLeaseToken string                    `json:"used_lease_token"`
-	ExecutedAt     string                    `json:"executed_at"`
+	State          RefPublicationState       `json:"state"`
 }
 
 // RefPublicationObservation is the typed observation verdict produced by a
@@ -721,14 +559,14 @@ func validatePushArgv(argv []string) error {
 		"--no-verify", "--porcelain", "--no-tags",
 	}
 	for _, marker := range want {
-		if !containsString(argv, marker) {
+		if !slices.Contains(argv, marker) {
 			return fmt.Errorf("ref publication push argv is missing %q", marker)
 		}
 	}
-	if !containsPrefix(argv, "--force-with-lease=") {
+	if !slices.ContainsFunc(argv, func(arg string) bool { return strings.HasPrefix(arg, "--force-with-lease=") }) {
 		return errors.New("ref publication push argv is missing the zero-OID --force-with-lease")
 	}
-	if !containsString(argv, "--no-replace-objects") {
+	if !slices.Contains(argv, "--no-replace-objects") {
 		return errors.New("ref publication push argv is missing --no-replace-objects")
 	}
 	for _, banned := range []string{
@@ -737,7 +575,7 @@ func validatePushArgv(argv []string) error {
 		"--push-option=", "--receive-pack=", "--upload-pack=",
 		"--exec=", "--server-option=", "--force", "--force-with-lease",
 	} {
-		if containsExact(argv, banned) {
+		if slices.Contains(argv, banned) {
 			return fmt.Errorf("ref publication push argv contains banned flag %q", banned)
 		}
 	}
@@ -770,10 +608,10 @@ func validateObserveArgv(argv []string) error {
 	if len(argv) < 5 {
 		return errors.New("ref publication observe argv is shorter than the mandatory shape")
 	}
-	if !containsString(argv, "ls-remote") {
+	if !slices.Contains(argv, "ls-remote") {
 		return errors.New("ref publication observe argv is missing ls-remote")
 	}
-	if !containsString(argv, "--heads") {
+	if !slices.Contains(argv, "--heads") {
 		return errors.New("ref publication observe argv is missing --heads")
 	}
 	for _, banned := range []string{
@@ -781,7 +619,7 @@ func validateObserveArgv(argv []string) error {
 		"--refs", "--refspec=", "--quiet", "-q",
 		"--tags", "--branches", "--remotes",
 	} {
-		if containsExact(argv, banned) || containsPrefix(argv, banned) {
+		if slices.Contains(argv, banned) || slices.ContainsFunc(argv, func(arg string) bool { return strings.HasPrefix(arg, banned) }) {
 			return fmt.Errorf("ref publication observe argv contains banned flag %q", banned)
 		}
 	}
@@ -863,26 +701,14 @@ func parseStrictPorcelain(
 		}
 	}
 	if rejectionCount > 0 {
-		return RefPublicationPushResult{
-			ServerStderr: strings.TrimSpace(string(stderr)),
-		}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, lastError)
+		return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, lastError)
 	}
 	if newBranchCount == 0 {
-		return RefPublicationPushResult{
-			ServerStderr: strings.TrimSpace(string(stderr)),
-		}, fmt.Errorf("%w: no [new branch] porcelain record: %q", ErrRefPublicationPorcelainMalformed, lastRecord)
+		return RefPublicationPushResult{}, fmt.Errorf("%w: no [new branch] porcelain record: %q", ErrRefPublicationPorcelainMalformed, lastRecord)
 	}
 	return RefPublicationPushResult{
 		Classification: RefPublicationAttributionProven,
-		Destination:    auth.DestinationRef,
-		SourceCommit:   auth.SourceCommit,
-		FromHash:       auth.SourceCommit,
-		ToRef:          auth.DestinationRef,
-		Reason:         "new branch",
-		ServerStderr:   strings.TrimSpace(string(stderr)),
-		UsedEndpoint:   auth.EndpointIdentity,
-		UsedLeaseToken: zeroOIDForObjectFormat(auth.SourceCommit),
-		ExecutedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+		State:          RefPubPushed,
 	}, nil
 }
 
@@ -1070,33 +896,6 @@ func writePrivateAlternatesRecord(path, value string) error {
 		return err
 	}
 	return nil
-}
-
-func containsString(haystack []string, needle string) bool {
-	for _, entry := range haystack {
-		if entry == needle {
-			return true
-		}
-	}
-	return false
-}
-
-func containsPrefix(haystack []string, prefix string) bool {
-	for _, entry := range haystack {
-		if strings.HasPrefix(entry, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsExact(haystack []string, value string) bool {
-	for _, entry := range haystack {
-		if entry == value {
-			return true
-		}
-	}
-	return false
 }
 
 // createPrivateBareRepo writes the on-disk skeleton of an empty bare

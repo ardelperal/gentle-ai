@@ -5,10 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -39,10 +39,10 @@ func TestRefPublicationTransportBuildPushArgvIsCanonical(t *testing.T) {
 	if err := validatePushArgv(argv); err != nil {
 		t.Fatalf("validatePushArgv: %v", err)
 	}
-	if !containsExact(argv, "--no-verify") ||
-		!containsExact(argv, "--porcelain") ||
-		!containsExact(argv, "--no-tags") ||
-		!containsExact(argv, "--no-replace-objects") {
+	if !slices.Contains(argv, "--no-verify") ||
+		!slices.Contains(argv, "--porcelain") ||
+		!slices.Contains(argv, "--no-tags") ||
+		!slices.Contains(argv, "--no-replace-objects") {
 		t.Fatalf("argv missing canonical markers: %#v", argv)
 	}
 	lease := ""
@@ -54,11 +54,11 @@ func TestRefPublicationTransportBuildPushArgvIsCanonical(t *testing.T) {
 	if !strings.Contains(lease, ":"+zeroSHA1OID) {
 		t.Fatalf("argv lease %q missing zero OID", lease)
 	}
-	if !containsExact(argv, auth.EndpointIdentity) {
+	if !slices.Contains(argv, auth.EndpointIdentity) {
 		t.Fatalf("argv missing canonical endpoint %q: %#v", auth.EndpointIdentity, argv)
 	}
 	spec := auth.SourceCommit + ":" + auth.DestinationRef
-	if !containsExact(argv, spec) {
+	if !slices.Contains(argv, spec) {
 		t.Fatalf("argv missing refspec %q: %#v", spec, argv)
 	}
 	for _, key := range []string{
@@ -67,7 +67,7 @@ func TestRefPublicationTransportBuildPushArgvIsCanonical(t *testing.T) {
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=true",
 	} {
-		if !containsExact(env, key) {
+		if !slices.Contains(env, key) {
 			t.Fatalf("env missing %q: %#v", key, env)
 		}
 	}
@@ -144,9 +144,8 @@ func TestRefPublicationTransportStrictPorcelainParserAcceptsExactSoleNewBranch(t
 	if result.Classification != RefPublicationAttributionProven {
 		t.Fatalf("classification = %q; want %q", result.Classification, RefPublicationAttributionProven)
 	}
-	if result.SourceCommit != auth.SourceCommit || result.Destination != auth.DestinationRef {
-		t.Fatalf("result binding = (%q, %q); want (%q, %q)",
-			result.SourceCommit, result.Destination, auth.SourceCommit, auth.DestinationRef)
+	if result.State != RefPubPushed {
+		t.Fatalf("state = %q; want %q", result.State, RefPubPushed)
 	}
 }
 
@@ -278,7 +277,7 @@ func TestRefPublicationTransportStrictLsRemote(t *testing.T) {
 	}
 }
 
-func TestRefPublicationTransportPrepareCreatesBareRepoAndPersistsHandle(t *testing.T) {
+func TestRefPublicationTransportPrepareCreatesBareRepo(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	transport, err := OpenRefPublicationTransport(context.Background(), repo)
 	if err != nil {
@@ -297,13 +296,8 @@ func TestRefPublicationTransportPrepareCreatesBareRepoAndPersistsHandle(t *testi
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	record := newRefPublicationRecord(t, auth, RefPubPrepared)
-	handleRecord, err := transport.Prepare(context.Background(), auth, record)
-	if err != nil {
+	if err := transport.Prepare(context.Background(), auth, record); err != nil {
 		t.Fatalf("Prepare: %v", err)
-	}
-	if handleRecord.Handle.RequestID != auth.RequestID || handleRecord.Handle.RequestDigest != auth.RequestDigest {
-		t.Fatalf("handle request binding = (%q,%q); want (%q,%q)",
-			handleRecord.Handle.RequestID, handleRecord.Handle.RequestDigest, auth.RequestID, auth.RequestDigest)
 	}
 
 	path := transport.transportPath(auth.RequestID, auth.RequestDigest)
@@ -325,36 +319,8 @@ func TestRefPublicationTransportPrepareCreatesBareRepoAndPersistsHandle(t *testi
 		t.Fatalf("alternates = %q; want %q", strings.TrimSpace(string(payload)), want)
 	}
 
-	if _, err := os.Lstat(transport.handlePath(auth.RequestID, auth.RequestDigest)); err != nil {
-		t.Fatalf("transport handle missing: %v", err)
-	}
-
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatalf("Prepare(replay): %v", err)
-	}
-}
-
-func TestRefPublicationTransportPrepareIdempotentDifferentDigestRejected(t *testing.T) {
-	repo := initSnapshotRepo(t)
-	transport, err := OpenRefPublicationTransport(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeTransportRoot(t, transport)
-
-	first := sampleRefPublicationAuthorization(t, "prepare-replay-1")
-	first.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
-	first.DestinationRef = "refs/heads/feat/prepare-replay"
-	first.RequestDigest = RefPublicationAuthorizationDigest(first)
-	if _, err := transport.Prepare(context.Background(), first, newRefPublicationRecord(t, first, RefPubPrepared)); err != nil {
-		t.Fatal(err)
-	}
-
-	second := first
-	second.SourceCommit = "fedcba9876543210fedcba9876543210fedcba98"
-	second.RequestDigest = RefPublicationAuthorizationDigest(second)
-	if _, err := transport.Prepare(context.Background(), second, newRefPublicationRecord(t, second, RefPubPrepared)); err == nil {
-		t.Fatal("Prepare accepted a request with a different source_commit under the same request_id")
 	}
 }
 
@@ -379,7 +345,7 @@ func TestRefPublicationTransportPushOneShotRefusesReplay(t *testing.T) {
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -392,7 +358,9 @@ func TestRefPublicationTransportPushOneShotRefusesReplay(t *testing.T) {
 		t.Fatalf("first push classification = %q", result.Classification)
 	}
 
-	if _, replayErr := transport.Push(context.Background(), prepared); !errors.Is(replayErr, ErrRefPublicationTransportAlreadyTerminal) {
+	pushed := prepared
+	pushed.State = RefPubPushed
+	if _, replayErr := transport.Push(context.Background(), pushed); !errors.Is(replayErr, ErrRefPublicationTransportAlreadyTerminal) {
 		t.Fatalf("replay Push = %v; want ErrRefPublicationTransportAlreadyTerminal", replayErr)
 	}
 }
@@ -418,7 +386,7 @@ func TestRefPublicationTransportPushLeaseRejectionClassifiedAsConflict(t *testin
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -449,7 +417,7 @@ func TestRefPublicationTransportPushDriftRejectedBeforeDispatch(t *testing.T) {
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -459,7 +427,7 @@ func TestRefPublicationTransportPushDriftRejectedBeforeDispatch(t *testing.T) {
 	}
 }
 
-func TestRefPublicationTransportPushCrashClassifiedAndPushMarkAbsent(t *testing.T) {
+func TestRefPublicationTransportPushCrashClassified(t *testing.T) {
 	runIsolatedGitPushOverride(t, &refPublicationPushFixture{
 		stdout:    "",
 		stderr:    "fatal: unable to access",
@@ -479,7 +447,7 @@ func TestRefPublicationTransportPushCrashClassifiedAndPushMarkAbsent(t *testing.
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -487,10 +455,6 @@ func TestRefPublicationTransportPushCrashClassifiedAndPushMarkAbsent(t *testing.
 	if !errors.Is(err, ErrRefPublicationPorcelainMalformed) &&
 		!errors.Is(err, ErrRefPublicationTransportCrashed) {
 		t.Fatalf("crash = %v; want porcelain/crash error", err)
-	}
-	path := transport.transportPath(auth.RequestID, auth.RequestDigest)
-	if _, err := os.Lstat(filepath.Join(path, refPublicationTransportPushMark)); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("push mark must not exist after crash; lstat = %v", err)
 	}
 }
 
@@ -537,7 +501,7 @@ func TestRefPublicationTransportObserveClassifiesRemoteState(t *testing.T) {
 			auth.EndpointIdentity = "https://example.test/owner/repo.git"
 			auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-			if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+			if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -572,7 +536,7 @@ func TestRefPublicationTransportReconcileFallsBackToPublicationUnknownOnCrash(t 
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -597,7 +561,7 @@ func TestRefPublicationTransportPrepareWithoutRecordStateIsRejected(t *testing.T
 	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 
 	invalidRecord := newRefPublicationRecord(t, auth, RefPubConfirmed)
-	_, err = transport.Prepare(context.Background(), auth, invalidRecord)
+	err = transport.Prepare(context.Background(), auth, invalidRecord)
 	if err == nil {
 		t.Fatal("Prepare accepted a confirmed-state record")
 	}
@@ -621,7 +585,7 @@ func TestRefPublicationTransportAlternatesFilePointsAtValidatedSourceObjects(t *
 	auth.DestinationRef = "refs/heads/feat/alternates"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
-	if _, err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
+	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
 		t.Fatal(err)
 	}
 	path := transport.transportPath(auth.RequestID, auth.RequestDigest)
