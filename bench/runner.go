@@ -38,6 +38,15 @@ type Sandbox struct {
 	// variable at all.
 	BenchCrashAtPhase string
 
+	// BenchTransportHelper, when non-empty, is read fresh from this field on
+	// every invoke and propagated as GENTLE_AI_TEST_TRANSPORT_HELPER. The
+	// transport reads it once per push to substitute a deterministic
+	// porcelain or ls-remote response so a journey can drive the
+	// create-only reviewed ref publication without touching a real remote
+	// (issue #1471). The encoding mirrors internal/reviewtransaction's own
+	// test fake: "1|<exit-error>|<stdout>|<stderr>".
+	BenchTransportHelper string
+
 	// NewLineageActivation opts this sandbox's whole isolated process
 	// environment into GENTLE_AI_RDD_NEW_LINEAGE (Wave 3 Slice 5, task 6.7).
 	// It is off by default, matching the product's own default-off
@@ -106,6 +115,9 @@ func (s *Sandbox) env() []string {
 	}
 	if s.BenchCrashAtPhase != "" {
 		env = append(env, "GENTLE_AI_BENCH_CRASH_AT_PHASE="+s.BenchCrashAtPhase)
+	}
+	if s.BenchTransportHelper != "" {
+		env = append(env, "GENTLE_AI_TEST_TRANSPORT_HELPER="+s.BenchTransportHelper)
 	}
 	if s.NewLineageActivation {
 		env = append(env, "GENTLE_AI_RDD_NEW_LINEAGE=1")

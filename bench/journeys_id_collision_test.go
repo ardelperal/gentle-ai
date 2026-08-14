@@ -56,6 +56,7 @@ func journeySources() []journeySource {
 		{"journeys_issue_3043.go", issue3043Journeys()},
 		{"journeys_repository_context.go", repositoryContextJourneys()},
 		{"journeys_provider_capture.go", providerCaptureRetryJourneys()},
+		{"journeys_issue_1471.go", issue1471Journeys()},
 	}
 }
 
