@@ -155,6 +155,9 @@ func (transport *RarRefPublicationTransport) Prepare(
 			ErrRefPublicationTransitionIllegal, record.State,
 		)
 	}
+	if err := transport.ProveBeforePublish(ctx, auth); err != nil {
+		return err
+	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
 		return err
 	}
@@ -231,6 +234,294 @@ func (transport *RarRefPublicationTransport) bindAlternates(path string) error {
 	return nil
 }
 
+// ProveBeforePublish re-runs the authorization checks the design requires
+// immediately before any push argv is built. The CLI calls it first; Prepare
+// and Push call it again so a replayed authorization cannot dispatch if the
+// receipt, source tree, manifest, endpoint, or review mode has drifted.
+func (transport *RarRefPublicationTransport) ProveBeforePublish(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if transport == nil || transport.repo == nil {
+		return errors.New("ref publication transport is not initialized")
+	}
+	if strings.HasPrefix(auth.EndpointIdentity, "git@") ||
+		strings.HasPrefix(auth.EndpointIdentity, "ssh://") {
+		if os.Getenv("SSH_AUTH_SOCK") == "" && os.Getenv("SSH_AGENT_PID") == "" {
+			return fmt.Errorf(
+				"%w: SSH endpoint %q requires SSH_AUTH_SOCK or SSH_AGENT_PID",
+				ErrRefPublicationTransportUnavailable, auth.EndpointIdentity,
+			)
+		}
+	}
+	if err := transport.verifyAuthorityLive(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyLocalSourceResolvesToCommit(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyCandidateTreeMatches(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyReviewedManifestMatches(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyEndpointIdentityUnchanged(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyAdvertisedSourceAdvertisesCommit(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyDestinationAbsentFromRemote(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyDestinationNotDefaultBranch(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyReviewModeEnabled(ctx, auth); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifyAuthorityLive re-derives the receipt the authorization was issued
+// for. lockNativeReceipt validates the lineage, authority_revision, and
+// terminal approved state; any rejection is surfaced as drift.
+func (transport *RarRefPublicationTransport) verifyAuthorityLive(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	native, _, release, err := transport.repo.rar.lockNativeReceipt(
+		ctx, auth.LineageID, auth.ReceiptRef,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: live receipt lookup: %v", ErrRefPublicationDriftRejected, err)
+	}
+	defer release()
+	if native.AuthorityRevision != auth.AuthorityRevision {
+		return fmt.Errorf(
+			"%w: receipt authority_revision %q does not match authorization %q",
+			ErrRefPublicationDriftRejected, native.AuthorityRevision, auth.AuthorityRevision,
+		)
+	}
+	return nil
+}
+
+// verifyLocalSourceResolvesToCommit checks `git rev-parse <L>` resolves to
+// the authorized source commit. Drift between L and C is fatal.
+func (transport *RarRefPublicationTransport) verifyLocalSourceResolvesToCommit(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	resolved, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"rev-parse", "--verify", auth.LocalSourceRef)
+	if err != nil {
+		return fmt.Errorf("%w: rev-parse %s: %v", ErrRefPublicationDriftRejected, auth.LocalSourceRef, err)
+	}
+	if resolved != auth.SourceCommit {
+		return fmt.Errorf("%w: refs/heads/L=%s but authorization source_commit=%s",
+			ErrRefPublicationDriftRejected, resolved, auth.SourceCommit)
+	}
+	return nil
+}
+
+// verifyCandidateTreeMatches checks `git rev-parse <C>^{tree}` matches the
+// authorized candidate tree.
+func (transport *RarRefPublicationTransport) verifyCandidateTreeMatches(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	resolved, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"rev-parse", "--verify", auth.SourceCommit+"^{tree}")
+	if err != nil {
+		return fmt.Errorf("%w: rev-parse %s^{tree}: %v",
+			ErrRefPublicationDriftRejected, auth.SourceCommit, err)
+	}
+	if resolved != auth.CandidateTree {
+		return fmt.Errorf("%w: C^{tree}=%s but authorization candidate_tree=%s",
+			ErrRefPublicationDriftRejected, resolved, auth.CandidateTree)
+	}
+	return nil
+}
+
+// verifyReviewedManifestMatches re-derives the path/mode/blob manifest at
+// the authorized candidate tree and compares its SHA-256 digest against
+// auth.PathManifestDigest. A tree that drifted path, mode, or blob since
+// the authorization was issued is fatal.
+func (transport *RarRefPublicationTransport) verifyReviewedManifestMatches(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-tree", "-r", "-z", auth.CandidateTree)
+	if err != nil {
+		return fmt.Errorf("%w: ls-tree %s: %v",
+			ErrRefPublicationDriftRejected, auth.CandidateTree, err)
+	}
+	digest := (RefPublicationManifest{Entries: parseLsTreePathModeBlobEntries(output)}).Digest()
+	if digest != auth.PathManifestDigest {
+		return fmt.Errorf("%w: candidate tree manifest digest %s does not match authorization %s",
+			ErrRefPublicationDriftRejected, digest, auth.PathManifestDigest)
+	}
+	return nil
+}
+
+// verifyEndpointIdentityUnchanged reads the configured remote origin URL,
+// strips the credentials segment if any, and compares the canonical form
+// against auth.EndpointIdentity. A swapped remote URL is fatal.
+func (transport *RarRefPublicationTransport) verifyEndpointIdentityUnchanged(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	configured, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"config", "--get", "remote.origin.url")
+	if err != nil {
+		return fmt.Errorf("%w: configured remote.origin.url is unreadable: %v",
+			ErrRefPublicationDriftRejected, err)
+	}
+	if canonicalizeEndpointURL(configured) != auth.EndpointIdentity {
+		return fmt.Errorf("%w: configured remote origin %q does not match authorized endpoint %q",
+			ErrRefPublicationDriftRejected, configured, auth.EndpointIdentity)
+	}
+	return nil
+}
+
+// verifyAdvertisedSourceAdvertisesCommit checks `git ls-remote --heads <ep>
+// <S>` reports the authorized source commit. A server that diverges from
+// the reviewed commit is fatal.
+func (transport *RarRefPublicationTransport) verifyAdvertisedSourceAdvertisesCommit(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--heads", auth.EndpointIdentity, auth.AdvertisedSourceRef)
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote %s %s: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, auth.AdvertisedSourceRef, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == auth.SourceCommit && fields[1] == auth.AdvertisedSourceRef {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: remote %s does not advertise %s at %s",
+		ErrRefPublicationDriftRejected, auth.EndpointIdentity, auth.AdvertisedSourceRef, auth.SourceCommit)
+}
+
+// verifyDestinationAbsentFromRemote checks the destination ref is not yet
+// present on the remote. A server that already has the ref advertises a
+// concurrent ref-creation race or a stale authorization.
+func (transport *RarRefPublicationTransport) verifyDestinationAbsentFromRemote(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--heads", auth.EndpointIdentity, auth.DestinationRef)
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote %s %s: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, auth.DestinationRef, err)
+	}
+	if strings.TrimSpace(string(output)) != "" {
+		return fmt.Errorf("%w: remote %s already advertises destination %s",
+			ErrRefPublicationDriftRejected, auth.EndpointIdentity, auth.DestinationRef)
+	}
+	return nil
+}
+
+// verifyDestinationNotDefaultBranch checks the remote HEAD symbol is not
+// the same ref as auth.DestinationRef. Refusing here defends against a
+// non-main default branch (trunk, develop, …) that ValidateRefPublicationDestinationRef
+// cannot statically recognize.
+func (transport *RarRefPublicationTransport) verifyDestinationNotDefaultBranch(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--symref", auth.EndpointIdentity, "HEAD")
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote --symref %s HEAD: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == "ref:" && fields[1] == auth.DestinationRef {
+			return fmt.Errorf("%w: destination %s is the remote default branch",
+				ErrRefPublicationDriftRejected, auth.DestinationRef)
+		}
+	}
+	return nil
+}
+
+// verifyReviewModeEnabled checks the review-mode kill switch is on. A
+// disabled mode means the receipt was issued under a regime this transport
+// refuses to dispatch.
+func (transport *RarRefPublicationTransport) verifyReviewModeEnabled(
+	ctx context.Context,
+	_ RefPublicationAuthorization,
+) error {
+	status, err := ResolveRDDMode(ctx, transport.repo.rar.identity.RepositoryRoot, RDDGlobalMode{})
+	if err != nil {
+		return fmt.Errorf("%w: resolve review mode: %v", ErrRefPublicationDriftRejected, err)
+	}
+	if !status.Enabled() {
+		return fmt.Errorf("%w: review mode is disabled (source=%s)",
+			ErrRefPublicationDriftRejected, status.Source)
+	}
+	return nil
+}
+
+// parseLsTreePathModeBlobEntries extracts (path, mode, blob_sha) tuples
+// from the NUL-separated output of `git ls-tree -r -z`. The mode and blob
+// are the fresh read of the candidate tree; any drift from the authorized
+// manifest is caught by verifyReviewedManifestMatches.
+func parseLsTreePathModeBlobEntries(payload []byte) []RefPublicationManifestEntry {
+	var entries []RefPublicationManifestEntry
+	for _, raw := range strings.Split(string(payload), "\x00") {
+		fields := strings.SplitN(raw, "\t", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		meta := strings.Fields(fields[0])
+		if len(meta) < 3 {
+			continue
+		}
+		entries = append(entries, RefPublicationManifestEntry{
+			Path: fields[1], Mode: meta[0], BlobSHA: meta[2],
+		})
+	}
+	return entries
+}
+
+// canonicalizeEndpointURL strips the userinfo segment from an endpoint URL
+// so two URLs that differ only in their (rejected) embedded credentials
+// canonicalize to the same identity.
+func canonicalizeEndpointURL(url string) string {
+	i := strings.Index(url, "://")
+	if i < 0 {
+		return url
+	}
+	rest := url[i+3:]
+	if j := strings.Index(rest, "@"); j >= 0 {
+		return url[:i+3] + rest[j+1:]
+	}
+	return url
+}
+
+// gitInventoryTrimmed runs a read-only git inventory command and returns
+// the trimmed stdout. The single-purpose helper keeps the proof-point
+// functions short.
+func gitInventoryTrimmed(ctx context.Context, repo string, args ...string) (string, error) {
+	output, err := runGitInventory(ctx, repo, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
 // Push executes the strictly sandboxed git push and parses its porcelain
 // output. The single attribution signal is one successful [new branch]
 // record for C -> refs/heads/<N>, with no other records, no rejections, and
@@ -260,6 +551,9 @@ func (transport *RarRefPublicationTransport) Push(
 	}
 	auth, err := ParseRefPublicationAuthorization(string(record.Payload))
 	if err != nil {
+		return RefPublicationPushResult{}, err
+	}
+	if err := transport.ProveBeforePublish(ctx, auth); err != nil {
 		return RefPublicationPushResult{}, err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
@@ -320,8 +614,10 @@ func (transport *RarRefPublicationTransport) buildPushCommandEnv(
 		"--no-replace-objects",
 		"-c", "core.attributesFile=" + filepath.Join(path, "info", "attributes"),
 		"-c", "core.bare=true",
+		"-c", "core.sshCommand=ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes",
 		"-c", "receive.denyDeleteCurrent=false",
 		"-c", "receive.denyNonFastForwards=false",
+		"-c", "protocol.allow=https,ssh",
 		"-c", "protocol.file.allow=never",
 		"-c", "protocol.ext.allow=never",
 		"push",
@@ -396,8 +692,6 @@ func (transport *RarRefPublicationTransport) sanitizedPushEnvironment(
 		"GIT_CONFIG_COUNT=0",
 		"GIT_ATTR_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=true",
-		"GIT_ASKPASS_REQUIRED=true",
 		"LC_ALL=C",
 		"LANG=C",
 		"PATH=" + os.Getenv("PATH"),
@@ -568,6 +862,9 @@ func validatePushArgv(argv []string) error {
 	}
 	if !slices.Contains(argv, "--no-replace-objects") {
 		return errors.New("ref publication push argv is missing --no-replace-objects")
+	}
+	if !slices.Contains(argv, "protocol.allow=https,ssh") {
+		return errors.New("ref publication push argv is missing protocol.allow=https,ssh")
 	}
 	for _, banned := range []string{
 		"--all", "--mirror", "--prune", "--atomic",

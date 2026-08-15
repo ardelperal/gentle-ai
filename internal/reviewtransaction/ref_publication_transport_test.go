@@ -45,6 +45,21 @@ func TestRefPublicationTransportBuildPushArgvIsCanonical(t *testing.T) {
 		!slices.Contains(argv, "--no-replace-objects") {
 		t.Fatalf("argv missing canonical markers: %#v", argv)
 	}
+	if !slices.Contains(argv, "protocol.allow=https,ssh") {
+		t.Fatalf("argv missing protocol allowlist: %#v", argv)
+	}
+	sshCommandOK := false
+	for _, arg := range argv {
+		if strings.HasPrefix(arg, "core.sshCommand=") &&
+			strings.Contains(arg, "StrictHostKeyChecking=yes") &&
+			strings.Contains(arg, "IdentitiesOnly=yes") {
+			sshCommandOK = true
+			break
+		}
+	}
+	if !sshCommandOK {
+		t.Fatalf("argv missing strict SSH core.sshCommand: %#v", argv)
+	}
 	lease := ""
 	for _, arg := range argv {
 		if strings.HasPrefix(arg, "--force-with-lease=") {
@@ -65,13 +80,16 @@ func TestRefPublicationTransportBuildPushArgvIsCanonical(t *testing.T) {
 		"GIT_DIR=" + path,
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=true",
 	} {
 		if !slices.Contains(env, key) {
 			t.Fatalf("env missing %q: %#v", key, env)
 		}
 	}
-	for _, banned := range []string{"push.default", "insteadOf", "pushInsteadOf"} {
+	for _, banned := range []string{
+		"GIT_ASKPASS=true",
+		"GIT_ASKPASS_REQUIRED=true",
+		"push.default", "insteadOf", "pushInsteadOf",
+	} {
 		for _, entry := range env {
 			if strings.Contains(entry, banned) {
 				t.Fatalf("env contains forbidden token %q: %s", banned, entry)
@@ -290,8 +308,7 @@ func TestRefPublicationTransportPrepareCreatesBareRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auth := sampleRefPublicationAuthorization(t, "prepare-creates")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "prepare-creates")
 	auth.DestinationRef = "refs/heads/feat/prepare-creates"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
@@ -325,24 +342,21 @@ func TestRefPublicationTransportPrepareCreatesBareRepo(t *testing.T) {
 }
 
 func TestRefPublicationTransportPushOneShotRefusesReplay(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	head := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD"))
 	runIsolatedGitPushOverride(t, &refPublicationPushFixture{
-		stdout: "To https://example.test/owner/repo.git\n" +
-			" * 0123456789abcdef0123456789abcdef01234567 -> refs/heads/feat/oneshot [new branch]\n" +
-			"Done\n",
+		stdout: fmt.Sprintf("To %s\n * %s -> refs/heads/feat/oneshot [new branch]\nDone\n", repo, head),
 		stderr: "",
 	}, defaultTransportMode)
 
-	repo := initSnapshotRepo(t)
 	transport, err := OpenRefPublicationTransport(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeTransportRoot(t, transport)
 
-	auth := sampleRefPublicationAuthorization(t, "oneshot")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "oneshot")
 	auth.DestinationRef = "refs/heads/feat/oneshot"
-	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -366,24 +380,21 @@ func TestRefPublicationTransportPushOneShotRefusesReplay(t *testing.T) {
 }
 
 func TestRefPublicationTransportPushLeaseRejectionClassifiedAsConflict(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	head := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD"))
 	runIsolatedGitPushOverride(t, &refPublicationPushFixture{
-		stdout: "To https://example.test/owner/repo.git\n" +
-			" ! 0123456789abcdef0123456789abcdef01234567 -> refs/heads/feat/conflict [rejected]\n" +
-			"Done\n",
+		stdout: fmt.Sprintf("To %s\n ! %s -> refs/heads/feat/conflict [rejected]\nDone\n", repo, head),
 		stderr: "remote: error: failed to push some refs",
 	}, defaultTransportMode)
 
-	repo := initSnapshotRepo(t)
 	transport, err := OpenRefPublicationTransport(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeTransportRoot(t, transport)
 
-	auth := sampleRefPublicationAuthorization(t, "lease-reject")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "lease-reject")
 	auth.DestinationRef = "refs/heads/feat/conflict"
-	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -397,24 +408,20 @@ func TestRefPublicationTransportPushLeaseRejectionClassifiedAsConflict(t *testin
 }
 
 func TestRefPublicationTransportPushDriftRejectedBeforeDispatch(t *testing.T) {
+	repo := initSnapshotRepo(t)
 	runIsolatedGitPushOverride(t, &refPublicationPushFixture{
-		stdout: "To https://example.test/owner/repo.git\n" +
-			" * fedcba9876543210fedcba9876543210fedcba98 -> refs/heads/feat/drift [new branch]\n" +
-			"Done\n",
+		stdout: fmt.Sprintf("To %s\n * fedcba9876543210fedcba9876543210fedcba98 -> refs/heads/feat/drift [new branch]\nDone\n", repo),
 		stderr: "",
 	}, defaultTransportMode)
 
-	repo := initSnapshotRepo(t)
 	transport, err := OpenRefPublicationTransport(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeTransportRoot(t, transport)
 
-	auth := sampleRefPublicationAuthorization(t, "drift-rejected")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "drift-rejected")
 	auth.DestinationRef = "refs/heads/feat/drift"
-	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -441,10 +448,8 @@ func TestRefPublicationTransportPushCrashClassified(t *testing.T) {
 	}
 	defer closeTransportRoot(t, transport)
 
-	auth := sampleRefPublicationAuthorization(t, "crash")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "crash")
 	auth.DestinationRef = "refs/heads/feat/crash"
-	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -460,45 +465,48 @@ func TestRefPublicationTransportPushCrashClassified(t *testing.T) {
 
 func TestRefPublicationTransportObserveClassifiesRemoteState(t *testing.T) {
 	cases := []struct {
-		name   string
-		stdout string
-		auth   *RefPublicationAuthorization
-		want   RefPublicationState
+		name           string
+		stdoutTemplate func(head string) string
+		destinationRef string
+		want           RefPublicationState
 	}{
 		{
-			name:   "destination absent",
-			stdout: "\n",
-			want:   RefPubNotCreated,
+			name:           "destination absent",
+			stdoutTemplate: func(head string) string { return "\n" },
+			destinationRef: "refs/heads/feat/observe-match",
+			want:           RefPubNotCreated,
 		},
 		{
-			name:   "destination matches C",
-			stdout: "0123456789abcdef0123456789abcdef01234567\trefs/heads/feat/observe-match\n",
-			want:   RefPubConfirmed,
+			name: "destination matches C",
+			stdoutTemplate: func(head string) string {
+				return head + "\trefs/heads/feat/observe-match\n"
+			},
+			destinationRef: "refs/heads/feat/observe-match",
+			want:           RefPubConfirmed,
 		},
 		{
-			name:   "destination drifts to another OID",
-			stdout: "fedcba9876543210fedcba9876543210fedcba98\trefs/heads/feat/observe-drift\n",
-			want:   RefPubConflict,
+			name: "destination drifts to another OID",
+			stdoutTemplate: func(head string) string {
+				return head[:len(head)-1] + "8\trefs/heads/feat/observe-drift\n"
+			},
+			destinationRef: "refs/heads/feat/observe-drift",
+			want:           RefPubConflict,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			runIsolatedGitPushOverride(t, &refPublicationPushFixture{stdout: tc.stdout}, observeTransportMode)
-
 			repo := initSnapshotRepo(t)
+			head := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+			runIsolatedGitPushOverride(t, &refPublicationPushFixture{stdout: tc.stdoutTemplate(head)}, observeTransportMode)
+
 			transport, err := OpenRefPublicationTransport(context.Background(), repo)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer closeTransportRoot(t, transport)
 
-			auth := sampleRefPublicationAuthorization(t, "observe-"+regexp.QuoteMeta(tc.name))
-			auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
-			auth.DestinationRef = "refs/heads/feat/observe-match"
-			if tc.name == "destination drifts to another OID" {
-				auth.DestinationRef = "refs/heads/feat/observe-drift"
-			}
-			auth.EndpointIdentity = "https://example.test/owner/repo.git"
+			auth := seedPublishRefAuthorization(t, repo, "observe-"+regexp.QuoteMeta(tc.name))
+			auth.DestinationRef = tc.destinationRef
 			auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 			if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -530,10 +538,8 @@ func TestRefPublicationTransportReconcileFallsBackToPublicationUnknownOnCrash(t 
 	}
 	defer closeTransportRoot(t, transport)
 
-	auth := sampleRefPublicationAuthorization(t, "reconcile")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "reconcile")
 	auth.DestinationRef = "refs/heads/feat/reconcile"
-	auth.EndpointIdentity = "https://example.test/owner/repo.git"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
 	if err := transport.Prepare(context.Background(), auth, newRefPublicationRecord(t, auth, RefPubPrepared)); err != nil {
@@ -580,8 +586,7 @@ func TestRefPublicationTransportAlternatesFilePointsAtValidatedSourceObjects(t *
 		t.Fatal(err)
 	}
 
-	auth := sampleRefPublicationAuthorization(t, "alternates-validate")
-	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth := seedPublishRefAuthorization(t, repo, "alternates-validate")
 	auth.DestinationRef = "refs/heads/feat/alternates"
 	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
 
@@ -646,7 +651,139 @@ func TestRefPublicationTransportRejectsCredentialAmbiguity(t *testing.T) {
 	}
 }
 
+// TestRefPublicationTransportProveAuthorityDriftRejected proves that
+// proveBeforePublish returns ErrRefPublicationDriftRejected when the receipt
+// the authorization names is absent on disk.
+func TestRefPublicationTransportProveAuthorityDriftRejected(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transport, err := OpenRefPublicationTransport(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTransportRoot(t, transport)
+	auth := sampleRefPublicationAuthorization(t, "drift-authority")
+	auth.LineageID = "absent-lineage"
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	if err := transport.ProveBeforePublish(context.Background(), auth); !errors.Is(err, ErrRefPublicationDriftRejected) {
+		t.Fatalf("ProveBeforePublish = %v; want ErrRefPublicationDriftRejected", err)
+	}
+}
+
+// TestRefPublicationTransportProveLocalSourceDriftRejected proves that the
+// local source ref no longer resolves to the authorized source commit.
+func TestRefPublicationTransportProveLocalSourceDriftRejected(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transport, err := OpenRefPublicationTransport(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTransportRoot(t, transport)
+	auth := seedPublishRefAuthorization(t, repo, "drift-source")
+	auth.SourceCommit = "0123456789abcdef0123456789abcdef01234567"
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	if err := transport.ProveBeforePublish(context.Background(), auth); !errors.Is(err, ErrRefPublicationDriftRejected) {
+		t.Fatalf("ProveBeforePublish = %v; want ErrRefPublicationDriftRejected", err)
+	}
+}
+
+// TestRefPublicationTransportProveManifestDriftRejected proves that the
+// path/mode/blob digest at the candidate tree no longer matches the
+// authorized manifest when the source blob is replaced.
+func TestRefPublicationTransportProveManifestDriftRejected(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transport, err := OpenRefPublicationTransport(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTransportRoot(t, transport)
+	auth := seedPublishRefAuthorization(t, repo, "drift-manifest")
+	gitSnapshot(t, repo, "commit", "--allow-empty", "-m", "manifest drift")
+	auth.SourceCommit = strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	if err := transport.ProveBeforePublish(context.Background(), auth); !errors.Is(err, ErrRefPublicationDriftRejected) {
+		t.Fatalf("ProveBeforePublish = %v; want ErrRefPublicationDriftRejected", err)
+	}
+}
+
+// TestRefPublicationTransportProveDefaultBranchRejected proves that the
+// destination ref is rejected when the remote default branch is exactly it.
+func TestRefPublicationTransportProveDefaultBranchRejected(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	transport, err := OpenRefPublicationTransport(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTransportRoot(t, transport)
+	auth := seedPublishRefAuthorization(t, repo, "drift-default-branch")
+	auth.DestinationRef = "refs/heads/master"
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	if err := transport.ProveBeforePublish(context.Background(), auth); !errors.Is(err, ErrRefPublicationDriftRejected) {
+		t.Fatalf("ProveBeforePublish = %v; want ErrRefPublicationDriftRejected", err)
+	}
+}
+
+// TestRefPublicationTransportProveSshAgentMissingRejected proves that an
+// SSH-style endpoint with no agent advertised is refused at prove time.
+func TestRefPublicationTransportProveSshAgentMissingRejected(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	auth := seedPublishRefAuthorization(t, repo, "ssh-no-agent")
+	auth.EndpointIdentity = "git@example.test:owner/repo.git"
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	t.Setenv("SSH_AGENT_PID", "")
+	transport, err := OpenRefPublicationTransport(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTransportRoot(t, transport)
+	if err := transport.ProveBeforePublish(context.Background(), auth); !errors.Is(err, ErrRefPublicationTransportUnavailable) {
+		t.Fatalf("ProveBeforePublish = %v; want ErrRefPublicationTransportUnavailable", err)
+	}
+}
+
 // -- test fakes for the git exec seam -------------------------------------------------
+
+// seedPublishRefAuthorization satisfies every proof point ProveBeforePublish
+// runs against the fixture repo: an approved receipt under "1471-lineage", a
+// local source ref pointing at HEAD, the real candidate tree and path
+// manifest digest, and a remote.origin.url the test repo itself can answer.
+// The test repo doubles as the remote so ls-remote stays local.
+func seedPublishRefAuthorization(t *testing.T, repo, token string) RefPublicationAuthorization {
+	t.Helper()
+	const lineage = "1471-lineage"
+	state, store, receipt := approvedCompactRevisionFixture(t, repo, lineage)
+	payload, err := canonicalRARReceiptPayload(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRef := sha256Ref(payload)
+	record, err := store.loadCompactRecordLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	tree := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", head+"^{tree}"))
+	manifestOutput := gitSnapshot(t, repo, "ls-tree", "-r", "-z", head)
+	entries := parseLsTreePathModeBlobEntries([]byte(manifestOutput))
+	digest := (RefPublicationManifest{Entries: entries}).Digest()
+	auth := sampleRefPublicationAuthorization(t, token)
+	auth.LineageID = lineage
+	auth.ReceiptRef = receiptRef
+	auth.AuthorityRevision = record.Revision
+	auth.SourceCommit = head
+	auth.CandidateTree = tree
+	auth.PathManifestDigest = digest
+	auth.EndpointIdentity = repo
+	if auth.DestinationRef != auth.LocalSourceRef {
+		gitSnapshot(t, repo, "update-ref", "-d", auth.DestinationRef)
+	}
+	gitSnapshot(t, repo, "update-ref", auth.LocalSourceRef, head)
+	gitSnapshot(t, repo, "config", "remote.origin.url", repo)
+	gitSnapshot(t, repo, "update-ref", "refs/heads/main", head)
+	auth.RequestDigest = RefPublicationAuthorizationDigest(auth)
+	_ = state
+	return auth
+}
 
 type transportMode int
 

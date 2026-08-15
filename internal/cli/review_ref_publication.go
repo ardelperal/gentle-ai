@@ -583,6 +583,9 @@ func reviewRefPublicationDispatchLifecycle(
 	if err != nil {
 		return reviewRefPublicationLifecycleErrorFrom(err)
 	}
+	if err := transport.ProveBeforePublish(ctx, auth); err != nil {
+		return reviewRefPublicationLifecycleErrorFrom(err)
+	}
 	if err := transport.Prepare(ctx, auth, persisted); err != nil {
 		return reviewRefPublicationLifecycleErrorFrom(err)
 	}
