@@ -639,7 +639,7 @@ func (err *reviewStartContextError) Unwrap() error { return err.Cause }
 
 func RunReview(args []string, stdout io.Writer) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		_, _ = fmt.Fprintln(stdout, "Usage: gentle-ai review <capture-result|capture-refuter|capture-validation|lens-context|capture-evidence|preserve-result|capabilities|start|finalize|validate|status|repair|invalidate|abandon|recover|retry-final-verification|reclaim|inspect-authority|inspect-candidate|dispose-result|reopen-results|schema|opencode-transport|bind-sdd> [flags]\n\nOrdinary review facade; repository scope, authority, canonical artifacts, and lifecycle transitions are derived by Go. Provider transports relay opaque bytes only; Go materializes, admits, captures, and decides delivery. Use review retry-final-verification only for a provider-proven completed failed final-verification tooling incident. Generic review recover remains unchanged. Use review repair --preflight for provider-owned classified authority repair.")
+		_, _ = fmt.Fprintln(stdout, "Usage: gentle-ai review <capture-result|capture-refuter|capture-validation|lens-context|capture-evidence|preserve-result|capabilities|start|finalize|validate|status|repair|invalidate|abandon|recover|retry-final-verification|reclaim|inspect-authority|inspect-candidate|dispose-result|reopen-results|publish-ref|publish-ref-status|publish-ref-reconcile|schema|opencode-transport|bind-sdd> [flags]\n\nOrdinary review facade; repository scope, authority, canonical artifacts, and lifecycle transitions are derived by Go. Provider transports relay opaque bytes only; Go materializes, admits, captures, and decides delivery. Use review retry-final-verification only for a provider-proven completed failed final-verification tooling incident. Generic review recover remains unchanged. Use review repair --preflight for provider-owned classified authority repair. `review publish-ref` is the explicit create-only reviewed ref publication for the design's tracker-bootstrap flow; `review publish-ref-status` and `review publish-ref-reconcile` are read-only companions that never push.")
 		return nil
 	}
 	operation, negotiated, preflightFailure := reviewIntegrationFailureRoute(args)
@@ -726,44 +726,59 @@ func runReviewCommandContext(ctx context.Context, args []string, stdout io.Write
 }
 
 func runReviewCommand(args []string, stdout io.Writer) error {
+	var dispatched error
 	switch args[0] {
 	case "capture-result":
-		return RunReviewCaptureResult(args[1:], stdout)
+		dispatched = RunReviewCaptureResult(args[1:], stdout)
 	case "capture-refuter":
-		return RunReviewCaptureRefuter(args[1:], stdout)
+		dispatched = RunReviewCaptureRefuter(args[1:], stdout)
 	case "capture-validation":
-		return RunReviewCaptureValidation(args[1:], stdout)
+		dispatched = RunReviewCaptureValidation(args[1:], stdout)
 	case "inspect-candidate":
-		return RunReviewInspectCandidate(args[1:], stdout)
+		dispatched = RunReviewInspectCandidate(args[1:], stdout)
 	case "lens-context":
-		return RunReviewLensContext(args[1:], stdout)
+		dispatched = RunReviewLensContext(args[1:], stdout)
 	case "capture-evidence":
-		return RunReviewCaptureEvidence(args[1:], stdout)
+		dispatched = RunReviewCaptureEvidence(args[1:], stdout)
 	case "preserve-result":
-		return RunReviewPreserveResult(args[1:], stdout)
+		dispatched = RunReviewPreserveResult(args[1:], stdout)
 	case "capabilities":
-		return RunReviewCapabilities(args[1:], stdout)
+		dispatched = RunReviewCapabilities(args[1:], stdout)
 	case "invalidate":
-		return RunReviewInvalidate(args[1:], stdout)
+		dispatched = RunReviewInvalidate(args[1:], stdout)
 	case "abandon":
-		return RunReviewAbandon(args[1:], stdout)
+		dispatched = RunReviewAbandon(args[1:], stdout)
 	case "recover":
-		return RunReviewRecover(args[1:], stdout)
+		dispatched = RunReviewRecover(args[1:], stdout)
 	case "reclaim":
-		return RunReviewReclaim(args[1:], stdout)
+		dispatched = RunReviewReclaim(args[1:], stdout)
 	case "inspect-authority":
-		return RunReviewInspectAuthority(args[1:], stdout)
+		dispatched = RunReviewInspectAuthority(args[1:], stdout)
 	case "dispose-result":
-		return RunReviewDisposeResult(args[1:], stdout)
+		dispatched = RunReviewDisposeResult(args[1:], stdout)
 	case "reopen-results":
-		return RunReviewReopenResults(args[1:], stdout)
+		dispatched = RunReviewReopenResults(args[1:], stdout)
+	case "publish-ref":
+		dispatched = RunReviewPublishRef(args[1:], stdout)
+	case "publish-ref-status":
+		dispatched = RunReviewPublishRefStatus(args[1:], stdout)
+	case "publish-ref-reconcile":
+		dispatched = RunReviewPublishRefReconcile(args[1:], stdout)
 	case "schema":
-		return RunReviewSchema(args[1:], stdout)
+		dispatched = RunReviewSchema(args[1:], stdout)
 	case "opencode-transport":
-		return RunReviewOpenCodeTransport(args[1:], stdout)
+		dispatched = RunReviewOpenCodeTransport(args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown review command %q", args[0])
 	}
+	// review.publish-ref* commands carry their own exit-code contract
+	// (0/1/2/75 mapped from the durable result state). The dispatcher
+	// is the only place that calls os.Exit so unit tests can capture
+	// the typed exit-envelope error without terminating the test binary.
+	if args[0] == "publish-ref" || args[0] == "publish-ref-status" || args[0] == "publish-ref-reconcile" {
+		return reviewRefPublicationDispatchExit(dispatched)
+	}
+	return dispatched
 }
 
 func runReviewStatus(ctx context.Context, args []string, stdout io.Writer) error {

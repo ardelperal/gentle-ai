@@ -77,6 +77,18 @@ var reviewIntegrationOperationRegistry = []reviewIntegrationOperationMetadata{
 	// negotiated finalize failure on the admitted routes reported less than the
 	// unsafe one did.
 	{Command: "finalize", Operation: ReviewIntegrationOperationFinalize, Label: "Review FINALIZE", Negotiated: true, ValueFlags: []string{"cwd", "agent", "lineage", "expected-revision", "target", "request-hash", "repository-context", "validation", "refuter", "evidence", "trace", "result", "result-artifact", "result-artifact-file"}, BoolFlags: []string{"failed", "captured-results", "captured-evidence"}, IntFlags: []string{"correction-lines"}, MutatesAuthority: true},
+	// review.publish-ref, review.publish-ref-status, and
+	// review.publish-ref-reconcile are the explicit create-only reviewed ref
+	// publication route (issue #1471). They are NOT part of the negotiated
+	// review-integration surface (Negotiated: false): the design publishes a
+	// fixed exit-code map (0/1/2/75) that does not match the negotiated
+	// failure envelope, and a non-1 exit code from a verb is the only signal
+	// a caller can branch on. They own the verb so the dispatch in
+	// review_facade.go can reach them; their operation names are reserved
+	// names that consumers can recognize when they appear in audit text.
+	{Command: "publish-ref", Operation: "review.publish_ref", Label: "Review PUBLISH-REF", MutatesAuthority: true},
+	{Command: "publish-ref-status", Operation: "review.publish_ref_status", Label: "Review PUBLISH-REF-STATUS"},
+	{Command: "publish-ref-reconcile", Operation: "review.publish_ref_reconcile", Label: "Review PUBLISH-REF-RECONCILE"},
 	// review.recover owns a verb without joining the published negotiated
 	// surface (see Negotiated above). It is emitted as an execute transition by
 	// reviewRecoveryCollection, both shipped status schemas publish it in their

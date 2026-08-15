@@ -2,14 +2,13 @@ package reviewtransaction
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 )
@@ -18,8 +17,6 @@ const (
 	refPublicationTransportsDirectory = "transports"
 	refPublicationTransportGitName    = "transport.git"
 	refPublicationTransportAlternates = "objects/info/alternates"
-	refPublicationTransportPushMark   = "push-completed"
-	refPublicationTransportPushLog    = "push.log"
 	refPublicationTransportMaxStdout  = 1 << 20
 	refPublicationTransportMaxStderr  = 64 << 10
 	refPublicationTransportPushWait   = 90 * time.Second
@@ -65,37 +62,6 @@ var (
 	// push. The one-use authorization budget forbids dispatching again.
 	ErrRefPublicationTransportAlreadyTerminal = errors.New("ref publication transport has already executed its single push")
 )
-
-// refPublicationTransportHandleSchema is the durable bind between the
-// prepared record and the on-disk isolated transport. It is persisted as a
-// sidecar so the read-only reconcile path can recover the transport
-// metadata without re-deriving it.
-const refPublicationTransportHandleSchema = "gentle-ai.review-ref-publication-transport-handle/v1"
-
-type refPublicationTransportHandleRecord struct {
-	Schema        string                      `json:"schema"`
-	RequestID     string                      `json:"request_id"`
-	RequestDigest string                      `json:"request_digest"`
-	TransportPath string                      `json:"transport_path"`
-	Authorization RefPublicationAuthorization `json:"authorization"`
-	CreatedAt     string                      `json:"created_at"`
-}
-
-func (handle refPublicationTransportHandleRecord) Validate() error {
-	if handle.Schema != refPublicationTransportHandleSchema {
-		return errors.New("ref publication transport handle schema is invalid")
-	}
-	if handle.RequestID == "" || !validSHA256(handle.RequestDigest) {
-		return errors.New("ref publication transport handle request binding is invalid")
-	}
-	if strings.TrimSpace(handle.TransportPath) == "" {
-		return errors.New("ref publication transport path is empty")
-	}
-	if err := handle.Authorization.Validate(); err != nil {
-		return fmt.Errorf("ref publication transport authorization: %w", err)
-	}
-	return nil
-}
 
 var (
 	porcelainHeaderLine = regexp.MustCompile(`^To (?P<url>[!-~\x20]+)$`)
@@ -163,16 +129,6 @@ func (transport *RarRefPublicationTransport) transportPath(
 	)
 }
 
-func (transport *RarRefPublicationTransport) handlePath(
-	requestID, requestDigest string,
-) string {
-	return filepath.Join(
-		transport.TransportRoot(),
-		requestID,
-		"handle.json",
-	)
-}
-
 // Prepare builds the isolated bare transport and persists the prepared record
 // under the supplied authorization. The same request_id may only be replayed
 // with the identical request_digest.
@@ -180,109 +136,59 @@ func (transport *RarRefPublicationTransport) Prepare(
 	ctx context.Context,
 	auth RefPublicationAuthorization,
 	record RefPublicationRecord,
-) (RefPublicationTransportHandleRecord, error) {
+) error {
 	if err := ctx.Err(); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if transport == nil || transport.repo == nil {
-		return RefPublicationTransportHandleRecord{}, errors.New("ref publication transport is not initialized")
+		return errors.New("ref publication transport is not initialized")
 	}
 	if err := auth.Validate(); err != nil {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf("ref publication authorization: %w", err)
+		return fmt.Errorf("ref publication authorization: %w", err)
 	}
 	if record.RequestID != auth.RequestID {
-		return RefPublicationTransportHandleRecord{}, errors.New("ref publication record request_id does not match authorization")
+		return errors.New("ref publication record request_id does not match authorization")
 	}
 	if record.State != RefPubPrepared && record.State != RefPubPushed {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf(
+		return fmt.Errorf(
 			"%w: prepare requires prepared or pushed state; got %q",
 			ErrRefPublicationTransitionIllegal, record.State,
 		)
 	}
+	if err := transport.ProveBeforePublish(ctx, auth); err != nil {
+		return err
+	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := ensureRARRepositoryRoot(transport.repo.rar.identity.GitCommonDir, transport.repo.rar.root, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := ensurePrivateRARDirectoryTree(transport.repo.rar.root, transport.repo.rar.root, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	parent := filepath.Dir(transport.transportPath(auth.RequestID, auth.RequestDigest))
 	if err := ensurePrivateRARDirectoryTree(transport.repo.rar.root, parent, true); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	path := transport.transportPath(auth.RequestID, auth.RequestDigest)
 	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
 		if err := transport.initBareTransport(ctx, path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 		if err := transport.bindAlternates(path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
-		}
-		if err := transport.clearPushMark(path); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 		if err := SyncReviewDirectory(filepath.Dir(path)); err != nil {
-			return RefPublicationTransportHandleRecord{}, err
+			return err
 		}
 	} else if err != nil {
-		return RefPublicationTransportHandleRecord{}, err
-	}
-	if existing, err := transport.loadHandleForRequestID(auth.RequestID); err == nil {
-		if existing.RequestDigest != auth.RequestDigest {
-			return RefPublicationTransportHandleRecord{}, fmt.Errorf(
-				"%w: request_id=%s", ErrRefPublicationReplayMismatch, auth.RequestID,
-			)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return RefPublicationTransportHandleRecord{}, err
-	}
-	handle := refPublicationTransportHandleRecord{
-		Schema:        refPublicationTransportHandleSchema,
-		RequestID:     auth.RequestID,
-		RequestDigest: auth.RequestDigest,
-		TransportPath: path,
-		Authorization: auth,
-		CreatedAt:     record.UpdatedAt,
-	}
-	payload, err := json.Marshal(handle)
-	if err != nil {
-		return RefPublicationTransportHandleRecord{}, fmt.Errorf("encode ref publication transport handle: %w", err)
-	}
-	if err := writePrivateRecordFile(transport.handlePath(auth.RequestID, auth.RequestDigest), payload); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationTransportHandleRecord{}, err
+		return err
 	}
-	return RefPublicationTransportHandleRecord{
-		Handle: handle,
-	}, nil
-}
-
-// loadHandleForRequestID re-reads the durable handle for a request_id. The
-// handle stores the exact request_digest bound when the handle was written;
-// a mismatch means a different authorization is being replayed under the
-// same request_id and Prepare must refuse.
-func (transport *RarRefPublicationTransport) loadHandleForRequestID(
-	requestID string,
-) (refPublicationTransportHandleRecord, error) {
-	payload, err := readPrivateRARFile(transport.handlePath(requestID, ""))
-	if err != nil {
-		return refPublicationTransportHandleRecord{}, err
-	}
-	var handle refPublicationTransportHandleRecord
-	if err := json.Unmarshal(payload, &handle); err != nil {
-		return refPublicationTransportHandleRecord{}, fmt.Errorf("parse ref publication transport handle: %w", err)
-	}
-	if handle.RequestID != requestID {
-		return refPublicationTransportHandleRecord{}, errors.New("ref publication transport handle request_id mismatch")
-	}
-	if err := handle.Validate(); err != nil {
-		return refPublicationTransportHandleRecord{}, err
-	}
-	return handle, nil
+	return nil
 }
 
 // initBareTransport creates the fresh empty private bare repo on disk. The
@@ -328,45 +234,302 @@ func (transport *RarRefPublicationTransport) bindAlternates(path string) error {
 	return nil
 }
 
-// clearPushMark removes the push-completed marker from a freshly-prepared
-// transport so the sole push can dispatch on the first call. Prepare is
-// always called against the absence of an executed push.
-func (transport *RarRefPublicationTransport) clearPushMark(path string) error {
-	mark := filepath.Join(path, refPublicationTransportPushMark)
-	if _, err := os.Lstat(mark); errors.Is(err, fs.ErrNotExist) {
-		return nil
-	} else if err != nil {
+// ProveBeforePublish re-runs the authorization checks the design requires
+// immediately before any push argv is built. The CLI calls it first; Prepare
+// and Push call it again so a replayed authorization cannot dispatch if the
+// receipt, source tree, manifest, endpoint, or review mode has drifted.
+func (transport *RarRefPublicationTransport) ProveBeforePublish(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.Remove(mark)
+	if transport == nil || transport.repo == nil {
+		return errors.New("ref publication transport is not initialized")
+	}
+	if strings.HasPrefix(auth.EndpointIdentity, "git@") ||
+		strings.HasPrefix(auth.EndpointIdentity, "ssh://") {
+		if os.Getenv("SSH_AUTH_SOCK") == "" && os.Getenv("SSH_AGENT_PID") == "" {
+			return fmt.Errorf(
+				"%w: SSH endpoint %q requires SSH_AUTH_SOCK or SSH_AGENT_PID",
+				ErrRefPublicationTransportUnavailable, auth.EndpointIdentity,
+			)
+		}
+	}
+	if err := transport.verifyAuthorityLive(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyLocalSourceResolvesToCommit(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyCandidateTreeMatches(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyReviewedManifestMatches(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyEndpointIdentityUnchanged(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyAdvertisedSourceAdvertisesCommit(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyDestinationAbsentFromRemote(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyDestinationNotDefaultBranch(ctx, auth); err != nil {
+		return err
+	}
+	if err := transport.verifyReviewModeEnabled(ctx, auth); err != nil {
+		return err
+	}
+	return nil
 }
 
-// markPushCompleted records that the prepared transport has dispatched
-// its sole successful push. Subsequent Push calls see this marker and are
-// rejected with ErrRefPublicationTransportAlreadyTerminal.
-func (transport *RarRefPublicationTransport) markPushCompleted(
-	path string,
+// verifyAuthorityLive re-derives the receipt the authorization was issued
+// for. lockNativeReceipt validates the lineage, authority_revision, and
+// terminal approved state; any rejection is surfaced as drift.
+func (transport *RarRefPublicationTransport) verifyAuthorityLive(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
 ) error {
-	dir := filepath.Join(path, "refs", "heads")
-	if err := ensurePrivateRARDirectoryTree(path, dir, true); err != nil {
-		return err
+	native, _, release, err := transport.repo.rar.lockNativeReceipt(
+		ctx, auth.LineageID, auth.ReceiptRef,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: live receipt lookup: %v", ErrRefPublicationDriftRejected, err)
 	}
-	if err := writePrivateRecordFile(
-		filepath.Join(path, refPublicationTransportPushMark),
-		[]byte(strconv.FormatInt(time.Now().UnixNano(), 10)),
-	); err != nil {
-		return err
+	defer release()
+	if native.AuthorityRevision != auth.AuthorityRevision {
+		return fmt.Errorf(
+			"%w: receipt authority_revision %q does not match authorization %q",
+			ErrRefPublicationDriftRejected, native.AuthorityRevision, auth.AuthorityRevision,
+		)
 	}
-	if _, err := os.Lstat(filepath.Join(path, refPublicationTransportPushLog)); errors.Is(err, fs.ErrNotExist) {
-		return nil
+	return nil
+}
+
+// verifyLocalSourceResolvesToCommit checks `git rev-parse <L>` resolves to
+// the authorized source commit. Drift between L and C is fatal.
+func (transport *RarRefPublicationTransport) verifyLocalSourceResolvesToCommit(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	resolved, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"rev-parse", "--verify", auth.LocalSourceRef)
+	if err != nil {
+		return fmt.Errorf("%w: rev-parse %s: %v", ErrRefPublicationDriftRejected, auth.LocalSourceRef, err)
 	}
-	return SyncReviewDirectory(filepath.Dir(filepath.Join(path, refPublicationTransportPushLog)))
+	if resolved != auth.SourceCommit {
+		return fmt.Errorf("%w: refs/heads/L=%s but authorization source_commit=%s",
+			ErrRefPublicationDriftRejected, resolved, auth.SourceCommit)
+	}
+	return nil
+}
+
+// verifyCandidateTreeMatches checks `git rev-parse <C>^{tree}` matches the
+// authorized candidate tree.
+func (transport *RarRefPublicationTransport) verifyCandidateTreeMatches(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	resolved, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"rev-parse", "--verify", auth.SourceCommit+"^{tree}")
+	if err != nil {
+		return fmt.Errorf("%w: rev-parse %s^{tree}: %v",
+			ErrRefPublicationDriftRejected, auth.SourceCommit, err)
+	}
+	if resolved != auth.CandidateTree {
+		return fmt.Errorf("%w: C^{tree}=%s but authorization candidate_tree=%s",
+			ErrRefPublicationDriftRejected, resolved, auth.CandidateTree)
+	}
+	return nil
+}
+
+// verifyReviewedManifestMatches re-derives the path/mode/blob manifest at
+// the authorized candidate tree and compares its SHA-256 digest against
+// auth.PathManifestDigest. A tree that drifted path, mode, or blob since
+// the authorization was issued is fatal.
+func (transport *RarRefPublicationTransport) verifyReviewedManifestMatches(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-tree", "-r", "-z", auth.CandidateTree)
+	if err != nil {
+		return fmt.Errorf("%w: ls-tree %s: %v",
+			ErrRefPublicationDriftRejected, auth.CandidateTree, err)
+	}
+	digest := (RefPublicationManifest{Entries: parseLsTreePathModeBlobEntries(output)}).Digest()
+	if digest != auth.PathManifestDigest {
+		return fmt.Errorf("%w: candidate tree manifest digest %s does not match authorization %s",
+			ErrRefPublicationDriftRejected, digest, auth.PathManifestDigest)
+	}
+	return nil
+}
+
+// verifyEndpointIdentityUnchanged reads the configured remote origin URL,
+// strips the credentials segment if any, and compares the canonical form
+// against auth.EndpointIdentity. A swapped remote URL is fatal.
+func (transport *RarRefPublicationTransport) verifyEndpointIdentityUnchanged(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	configured, err := gitInventoryTrimmed(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"config", "--get", "remote.origin.url")
+	if err != nil {
+		return fmt.Errorf("%w: configured remote.origin.url is unreadable: %v",
+			ErrRefPublicationDriftRejected, err)
+	}
+	if canonicalizeEndpointURL(configured) != auth.EndpointIdentity {
+		return fmt.Errorf("%w: configured remote origin %q does not match authorized endpoint %q",
+			ErrRefPublicationDriftRejected, configured, auth.EndpointIdentity)
+	}
+	return nil
+}
+
+// verifyAdvertisedSourceAdvertisesCommit checks `git ls-remote --heads <ep>
+// <S>` reports the authorized source commit. A server that diverges from
+// the reviewed commit is fatal.
+func (transport *RarRefPublicationTransport) verifyAdvertisedSourceAdvertisesCommit(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--heads", auth.EndpointIdentity, auth.AdvertisedSourceRef)
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote %s %s: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, auth.AdvertisedSourceRef, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == auth.SourceCommit && fields[1] == auth.AdvertisedSourceRef {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: remote %s does not advertise %s at %s",
+		ErrRefPublicationDriftRejected, auth.EndpointIdentity, auth.AdvertisedSourceRef, auth.SourceCommit)
+}
+
+// verifyDestinationAbsentFromRemote checks the destination ref is not yet
+// present on the remote. A server that already has the ref advertises a
+// concurrent ref-creation race or a stale authorization.
+func (transport *RarRefPublicationTransport) verifyDestinationAbsentFromRemote(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--heads", auth.EndpointIdentity, auth.DestinationRef)
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote %s %s: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, auth.DestinationRef, err)
+	}
+	if strings.TrimSpace(string(output)) != "" {
+		return fmt.Errorf("%w: remote %s already advertises destination %s",
+			ErrRefPublicationDriftRejected, auth.EndpointIdentity, auth.DestinationRef)
+	}
+	return nil
+}
+
+// verifyDestinationNotDefaultBranch checks the remote HEAD symbol is not
+// the same ref as auth.DestinationRef. Refusing here defends against a
+// non-main default branch (trunk, develop, …) that ValidateRefPublicationDestinationRef
+// cannot statically recognize.
+func (transport *RarRefPublicationTransport) verifyDestinationNotDefaultBranch(
+	ctx context.Context,
+	auth RefPublicationAuthorization,
+) error {
+	output, err := runGitInventory(ctx, transport.repo.rar.identity.RepositoryRoot,
+		"ls-remote", "--symref", auth.EndpointIdentity, "HEAD")
+	if err != nil {
+		return fmt.Errorf("%w: ls-remote --symref %s HEAD: %v",
+			ErrRefPublicationTransportUnavailable, auth.EndpointIdentity, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == "ref:" && fields[1] == auth.DestinationRef {
+			return fmt.Errorf("%w: destination %s is the remote default branch",
+				ErrRefPublicationDriftRejected, auth.DestinationRef)
+		}
+	}
+	return nil
+}
+
+// verifyReviewModeEnabled checks the review-mode kill switch is on. A
+// disabled mode means the receipt was issued under a regime this transport
+// refuses to dispatch.
+func (transport *RarRefPublicationTransport) verifyReviewModeEnabled(
+	ctx context.Context,
+	_ RefPublicationAuthorization,
+) error {
+	status, err := ResolveRDDMode(ctx, transport.repo.rar.identity.RepositoryRoot, RDDGlobalMode{})
+	if err != nil {
+		return fmt.Errorf("%w: resolve review mode: %v", ErrRefPublicationDriftRejected, err)
+	}
+	if !status.Enabled() {
+		return fmt.Errorf("%w: review mode is disabled (source=%s)",
+			ErrRefPublicationDriftRejected, status.Source)
+	}
+	return nil
+}
+
+// parseLsTreePathModeBlobEntries extracts (path, mode, blob_sha) tuples
+// from the NUL-separated output of `git ls-tree -r -z`. The mode and blob
+// are the fresh read of the candidate tree; any drift from the authorized
+// manifest is caught by verifyReviewedManifestMatches.
+func parseLsTreePathModeBlobEntries(payload []byte) []RefPublicationManifestEntry {
+	var entries []RefPublicationManifestEntry
+	for _, raw := range strings.Split(string(payload), "\x00") {
+		fields := strings.SplitN(raw, "\t", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		meta := strings.Fields(fields[0])
+		if len(meta) < 3 {
+			continue
+		}
+		entries = append(entries, RefPublicationManifestEntry{
+			Path: fields[1], Mode: meta[0], BlobSHA: meta[2],
+		})
+	}
+	return entries
+}
+
+// canonicalizeEndpointURL strips the userinfo segment from an endpoint URL
+// so two URLs that differ only in their (rejected) embedded credentials
+// canonicalize to the same identity.
+func canonicalizeEndpointURL(url string) string {
+	i := strings.Index(url, "://")
+	if i < 0 {
+		return url
+	}
+	rest := url[i+3:]
+	if j := strings.Index(rest, "@"); j >= 0 {
+		return url[:i+3] + rest[j+1:]
+	}
+	return url
+}
+
+// gitInventoryTrimmed runs a read-only git inventory command and returns
+// the trimmed stdout. The single-purpose helper keeps the proof-point
+// functions short.
+func gitInventoryTrimmed(ctx context.Context, repo string, args ...string) (string, error) {
+	output, err := runGitInventory(ctx, repo, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // Push executes the strictly sandboxed git push and parses its porcelain
 // output. The single attribution signal is one successful [new branch]
 // record for C -> refs/heads/<N>, with no other records, no rejections, and
 // empty stderr. Anything else yields a typed error.
+//
+// The state machine (Prepared → Pushed) is the only "already pushed"
+// detector: a second call with state already RefPubPushed is rejected with
+// ErrRefPublicationTransportAlreadyTerminal.
 func (transport *RarRefPublicationTransport) Push(
 	ctx context.Context,
 	record RefPublicationRecord,
@@ -377,14 +540,20 @@ func (transport *RarRefPublicationTransport) Push(
 	if transport == nil || transport.repo == nil {
 		return RefPublicationPushResult{}, errors.New("ref publication transport is not initialized")
 	}
-	if record.State != RefPubPrepared && record.State != RefPubPushed {
+	if record.State == RefPubPushed {
+		return RefPublicationPushResult{}, ErrRefPublicationTransportAlreadyTerminal
+	}
+	if record.State != RefPubPrepared {
 		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: push requires prepared or pushed state; got %q",
+			"%w: push requires prepared state; got %q",
 			ErrRefPublicationTransitionIllegal, record.State,
 		)
 	}
 	auth, err := ParseRefPublicationAuthorization(string(record.Payload))
 	if err != nil {
+		return RefPublicationPushResult{}, err
+	}
+	if err := transport.ProveBeforePublish(ctx, auth); err != nil {
 		return RefPublicationPushResult{}, err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
@@ -400,12 +569,6 @@ func (transport *RarRefPublicationTransport) Push(
 	if err := validatePrivateRARDirectory(path); err != nil {
 		return RefPublicationPushResult{}, err
 	}
-	markPath := filepath.Join(path, refPublicationTransportPushMark)
-	if _, err := os.Lstat(markPath); err == nil {
-		return RefPublicationPushResult{}, ErrRefPublicationTransportAlreadyTerminal
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return RefPublicationPushResult{}, err
-	}
 	argv, env, err := transport.buildPushCommandEnv(auth, path)
 	if err != nil {
 		return RefPublicationPushResult{}, err
@@ -416,30 +579,12 @@ func (transport *RarRefPublicationTransport) Push(
 		if len(stderr) != 0 && ctx.Err() == nil && isLeaseRejection(stderr, parseErr) {
 			return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, parseErr)
 		}
-		if attribution.ServerStderr == "" {
-			attribution.ServerStderr = strings.TrimSpace(string(stderr))
-		}
 		return RefPublicationPushResult{}, parseErr
 	}
 	if runErr != nil {
 		return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationTransportCrashed, runErr)
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
-		return RefPublicationPushResult{}, err
-	}
-	if attribution.SourceCommit != auth.SourceCommit {
-		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: porcelain from=%s does not match authorized source_commit=%s",
-			ErrRefPublicationDriftRejected, attribution.SourceCommit, auth.SourceCommit,
-		)
-	}
-	if attribution.Destination != auth.DestinationRef {
-		return RefPublicationPushResult{}, fmt.Errorf(
-			"%w: porcelain to=%s does not match authorized destination_ref=%s",
-			ErrRefPublicationDriftRejected, attribution.Destination, auth.DestinationRef,
-		)
-	}
-	if err := transport.markPushCompleted(path); err != nil {
 		return RefPublicationPushResult{}, err
 	}
 	if err := transport.repo.rar.validateIdentity(ctx); err != nil {
@@ -469,8 +614,10 @@ func (transport *RarRefPublicationTransport) buildPushCommandEnv(
 		"--no-replace-objects",
 		"-c", "core.attributesFile=" + filepath.Join(path, "info", "attributes"),
 		"-c", "core.bare=true",
+		"-c", "core.sshCommand=ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes",
 		"-c", "receive.denyDeleteCurrent=false",
 		"-c", "receive.denyNonFastForwards=false",
+		"-c", "protocol.allow=https,ssh",
 		"-c", "protocol.file.allow=never",
 		"-c", "protocol.ext.allow=never",
 		"push",
@@ -545,8 +692,6 @@ func (transport *RarRefPublicationTransport) sanitizedPushEnvironment(
 		"GIT_CONFIG_COUNT=0",
 		"GIT_ATTR_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=true",
-		"GIT_ASKPASS_REQUIRED=true",
 		"LC_ALL=C",
 		"LANG=C",
 		"PATH=" + os.Getenv("PATH"),
@@ -664,26 +809,13 @@ func (transport *RarRefPublicationTransport) Reconcile(
 	}, nil
 }
 
-// RefPublicationTransportHandleRecord is the typed return value of Prepare.
-type RefPublicationTransportHandleRecord struct {
-	Handle refPublicationTransportHandleRecord
-}
-
 // RefPublicationPushResult is the typed attribution verdict for the single
 // push attempt. A successful Push returns Result with Classification set
-// to AttributionProven; any other condition is returned as a typed error
-// instead.
+// to AttributionProven and State set to RefPubPushed; any other condition
+// is returned as a typed error instead.
 type RefPublicationPushResult struct {
 	Classification RefPublicationAttribution `json:"classification"`
-	Destination    string                    `json:"destination"`
-	SourceCommit   string                    `json:"source_commit"`
-	FromHash       string                    `json:"from_hash"`
-	ToRef          string                    `json:"to_ref"`
-	Reason         string                    `json:"reason"`
-	ServerStderr   string                    `json:"server_stderr"`
-	UsedEndpoint   string                    `json:"used_endpoint"`
-	UsedLeaseToken string                    `json:"used_lease_token"`
-	ExecutedAt     string                    `json:"executed_at"`
+	State          RefPublicationState       `json:"state"`
 }
 
 // RefPublicationObservation is the typed observation verdict produced by a
@@ -721,15 +853,18 @@ func validatePushArgv(argv []string) error {
 		"--no-verify", "--porcelain", "--no-tags",
 	}
 	for _, marker := range want {
-		if !containsString(argv, marker) {
+		if !slices.Contains(argv, marker) {
 			return fmt.Errorf("ref publication push argv is missing %q", marker)
 		}
 	}
-	if !containsPrefix(argv, "--force-with-lease=") {
+	if !slices.ContainsFunc(argv, func(arg string) bool { return strings.HasPrefix(arg, "--force-with-lease=") }) {
 		return errors.New("ref publication push argv is missing the zero-OID --force-with-lease")
 	}
-	if !containsString(argv, "--no-replace-objects") {
+	if !slices.Contains(argv, "--no-replace-objects") {
 		return errors.New("ref publication push argv is missing --no-replace-objects")
+	}
+	if !slices.Contains(argv, "protocol.allow=https,ssh") {
+		return errors.New("ref publication push argv is missing protocol.allow=https,ssh")
 	}
 	for _, banned := range []string{
 		"--all", "--mirror", "--prune", "--atomic",
@@ -737,7 +872,7 @@ func validatePushArgv(argv []string) error {
 		"--push-option=", "--receive-pack=", "--upload-pack=",
 		"--exec=", "--server-option=", "--force", "--force-with-lease",
 	} {
-		if containsExact(argv, banned) {
+		if slices.Contains(argv, banned) {
 			return fmt.Errorf("ref publication push argv contains banned flag %q", banned)
 		}
 	}
@@ -770,10 +905,10 @@ func validateObserveArgv(argv []string) error {
 	if len(argv) < 5 {
 		return errors.New("ref publication observe argv is shorter than the mandatory shape")
 	}
-	if !containsString(argv, "ls-remote") {
+	if !slices.Contains(argv, "ls-remote") {
 		return errors.New("ref publication observe argv is missing ls-remote")
 	}
-	if !containsString(argv, "--heads") {
+	if !slices.Contains(argv, "--heads") {
 		return errors.New("ref publication observe argv is missing --heads")
 	}
 	for _, banned := range []string{
@@ -781,7 +916,7 @@ func validateObserveArgv(argv []string) error {
 		"--refs", "--refspec=", "--quiet", "-q",
 		"--tags", "--branches", "--remotes",
 	} {
-		if containsExact(argv, banned) || containsPrefix(argv, banned) {
+		if slices.Contains(argv, banned) || slices.ContainsFunc(argv, func(arg string) bool { return strings.HasPrefix(arg, banned) }) {
 			return fmt.Errorf("ref publication observe argv contains banned flag %q", banned)
 		}
 	}
@@ -863,26 +998,14 @@ func parseStrictPorcelain(
 		}
 	}
 	if rejectionCount > 0 {
-		return RefPublicationPushResult{
-			ServerStderr: strings.TrimSpace(string(stderr)),
-		}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, lastError)
+		return RefPublicationPushResult{}, fmt.Errorf("%w: %v", ErrRefPublicationLeaseRejected, lastError)
 	}
 	if newBranchCount == 0 {
-		return RefPublicationPushResult{
-			ServerStderr: strings.TrimSpace(string(stderr)),
-		}, fmt.Errorf("%w: no [new branch] porcelain record: %q", ErrRefPublicationPorcelainMalformed, lastRecord)
+		return RefPublicationPushResult{}, fmt.Errorf("%w: no [new branch] porcelain record: %q", ErrRefPublicationPorcelainMalformed, lastRecord)
 	}
 	return RefPublicationPushResult{
 		Classification: RefPublicationAttributionProven,
-		Destination:    auth.DestinationRef,
-		SourceCommit:   auth.SourceCommit,
-		FromHash:       auth.SourceCommit,
-		ToRef:          auth.DestinationRef,
-		Reason:         "new branch",
-		ServerStderr:   strings.TrimSpace(string(stderr)),
-		UsedEndpoint:   auth.EndpointIdentity,
-		UsedLeaseToken: zeroOIDForObjectFormat(auth.SourceCommit),
-		ExecutedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+		State:          RefPubPushed,
 	}, nil
 }
 
@@ -1070,33 +1193,6 @@ func writePrivateAlternatesRecord(path, value string) error {
 		return err
 	}
 	return nil
-}
-
-func containsString(haystack []string, needle string) bool {
-	for _, entry := range haystack {
-		if entry == needle {
-			return true
-		}
-	}
-	return false
-}
-
-func containsPrefix(haystack []string, prefix string) bool {
-	for _, entry := range haystack {
-		if strings.HasPrefix(entry, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsExact(haystack []string, value string) bool {
-	for _, entry := range haystack {
-		if entry == value {
-			return true
-		}
-	}
-	return false
 }
 
 // createPrivateBareRepo writes the on-disk skeleton of an empty bare
