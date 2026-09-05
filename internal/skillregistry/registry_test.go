@@ -621,15 +621,102 @@ func TestParseFrontmatterHandlesCRLF(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotName, gotDesc := parseFrontmatter(tc.source)
-			if gotName != tc.wantName {
-				t.Errorf("name = %q, want %q", gotName, tc.wantName)
+			gotName := parseFrontmatter(tc.source)
+			if gotName.Name != tc.wantName {
+				t.Errorf("name = %q, want %q", gotName.Name, tc.wantName)
 			}
-			if gotDesc != tc.wantDesc {
-				t.Errorf("description = %q, want %q", gotDesc, tc.wantDesc)
+			if gotName.Description != tc.wantDesc {
+				t.Errorf("description = %q, want %q", gotName.Description, tc.wantDesc)
 			}
 		})
 	}
+}
+
+func TestParseFrontmatterMetadataTiers(t *testing.T) {
+	cases := []struct {
+		name      string
+		source    string
+		wantName  string
+		wantDesc  string
+		wantAuth  string
+		wantVer   string
+		wantTiers []string
+	}{
+		{
+			name:     "no metadata block",
+			source:   "---\nname: x\ndescription: ok\n---\n",
+			wantName: "x", wantDesc: "ok",
+		},
+		{
+			name:      "inline tiers list",
+			source:    "---\nname: x\ndescription: ok\nmetadata:\n  tiers: [vba, runtime]\n---\n",
+			wantName: "x", wantDesc: "ok",
+			wantTiers: []string{"vba", "runtime"},
+		},
+		{
+			name:      "multiline tiers list (yaml block)",
+			source:    "---\nname: x\ndescription: ok\nmetadata:\n  tiers:\n    - vba\n    - runtime\n---\n",
+			wantName: "x", wantDesc: "ok",
+			wantTiers: []string{"vba", "runtime"},
+		},
+		{
+			name:      "scalar tier (single value)",
+			source:    "---\nname: x\ndescription: ok\nmetadata:\n  tiers: vba\n---\n",
+			wantName: "x", wantDesc: "ok",
+			wantTiers: []string{"vba"},
+		},
+		{
+			name:      "empty brackets",
+			source:    "---\nname: x\ndescription: ok\nmetadata:\n  tiers: []\n---\n",
+			wantName: "x", wantDesc: "ok",
+		},
+		{
+			name:     "full metadata block (author + version + tiers)",
+			source:   "---\nname: x\ndescription: ok\nmetadata:\n  author: ardelperal\n  version: \"1.0\"\n  tiers: [universal]\n---\n",
+			wantName: "x", wantDesc: "ok",
+			wantAuth:  "ardelperal",
+			wantVer:   "1.0",
+			wantTiers: []string{"universal"},
+		},
+		{
+			name:      "metadata then return to top-level key",
+			source:    "---\nname: x\ndescription: ok\nmetadata:\n  tiers: [vba]\n---\nlicense: Apache-2.0\n",
+			wantName: "x", wantDesc: "ok",
+			wantTiers: []string{"vba"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fm := parseFrontmatter(tc.source)
+			if fm.Name != tc.wantName {
+				t.Errorf("Name = %q, want %q", fm.Name, tc.wantName)
+			}
+			if fm.Description != tc.wantDesc {
+				t.Errorf("Description = %q, want %q", fm.Description, tc.wantDesc)
+			}
+			if fm.Author != tc.wantAuth {
+				t.Errorf("Author = %q, want %q", fm.Author, tc.wantAuth)
+			}
+			if fm.Version != tc.wantVer {
+				t.Errorf("Version = %q, want %q", fm.Version, tc.wantVer)
+			}
+			if !sameTiers(fm.Tiers, tc.wantTiers) {
+				t.Errorf("Tiers = %v, want %v", fm.Tiers, tc.wantTiers)
+			}
+		})
+	}
+}
+
+func sameTiers(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestFindAllSkillFilesFollowsSymlinkedSkillDir(t *testing.T) {
@@ -763,10 +850,35 @@ func assertSkillEntries(t *testing.T, got, want []SkillEntry) {
 		t.Fatalf("len(entries) = %d, want %d\nentries = %#v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if got[i].Name != want[i].Name ||
+			got[i].Path != want[i].Path ||
+			got[i].Description != want[i].Description ||
+			got[i].Author != want[i].Author ||
+			got[i].Version != want[i].Version {
 			t.Fatalf("entries[%d] = %#v, want %#v\nall entries = %#v", i, got[i], want[i], got)
 		}
+		// Tiers slice — order-independent comparison.
+		if !sameStringSet(got[i].Tiers, want[i].Tiers) {
+			t.Fatalf("entries[%d].Tiers = %#v, want %#v\nall entries = %#v", i, got[i].Tiers, want[i].Tiers, got)
+		}
 	}
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, v := range a {
+		seen[v]++
+	}
+	for _, v := range b {
+		seen[v]--
+		if seen[v] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func assertRegistrySkills(

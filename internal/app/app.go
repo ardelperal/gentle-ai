@@ -20,6 +20,8 @@ import (
 	"github.com/gentleman-programming/gentle-ai/v2/internal/planner"
 	"github.com/gentleman-programming/gentle-ai/v2/internal/reviewtransaction"
 	"github.com/gentleman-programming/gentle-ai/v2/internal/skillregistry"
+	skillstiers "github.com/gentleman-programming/gentle-ai/v2/internal/components/skills/tiers"
+	sktui "github.com/gentleman-programming/gentle-ai/v2/internal/components/skills/tui"
 	"github.com/gentleman-programming/gentle-ai/v2/internal/state"
 	"github.com/gentleman-programming/gentle-ai/v2/internal/system"
 	"github.com/gentleman-programming/gentle-ai/v2/internal/tui"
@@ -98,6 +100,8 @@ func RunArgs(args []string, stdout io.Writer) error {
 			return runUninstall(args[1:], stdout)
 		case "skill-registry":
 			return runSkillRegistry(args[1:], stdout)
+		case "skills":
+			return runSkills(args[1:], stdout)
 		case "sdd-status":
 			return cli.RunSDDStatus(args[1:], stdout)
 		case "sdd-continue":
@@ -485,6 +489,156 @@ func runSkillRegistryList(args []string, stdout io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "%s\t%s\t%s\n", e.Name, skillregistry.ScopeForPath(cwd, e.Path), e.Path)
 	}
 	return nil
+}
+
+// runSkills handles `gentle-ai skills list [--tier X,Y] [--json] [--cwd DIR]`.
+// It reuses skillregistry.List to find SKILL.md files, projects each entry
+// through the tiers package, optionally filters by tier, and prints either a
+// human-readable table or a JSON document.
+func runSkills(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: gentle-ai skills <list|tui> [flags]")
+	}
+	switch args[0] {
+	case "list":
+		return runSkillsList(args[1:], stdout)
+	case "tui":
+		return runSkillsTUI(args[1:], stdout)
+	default:
+		return fmt.Errorf("unknown skills command %q (want list or tui)", args[0])
+	}
+}
+
+func runSkillsList(args []string, stdout io.Writer) error {
+	var (
+		cwd     string
+		asJSON  bool
+		rawTiers []string
+	)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: gentle-ai skills list [--tier NAME[,NAME...]] [--json] [--cwd DIR]")
+			return nil
+		case "--cwd":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cwd requires a value")
+			}
+			cwd = args[i+1]
+			i++
+		case "--json":
+			asJSON = true
+		case "--tier":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tier requires a value (comma-separated)")
+			}
+			rawTiers = append(rawTiers, strings.Split(args[i+1], ",")...)
+			i++
+		default:
+			return fmt.Errorf("unknown skills list argument %q", args[i])
+		}
+	}
+	resolvedCwd, home, err := resolveSkillRegistryDirs(cwd)
+	if err != nil {
+		return err
+	}
+	entries := skillregistry.List(resolvedCwd, home)
+	proj := skillstiers.FromSkillEntries(entries)
+	wanted := skillstiers.Normalize(rawTiers)
+	filtered := skillstiers.Filter(proj, wanted)
+
+	if asJSON {
+		type row struct {
+			Name        string   `json:"name"`
+			Scope       string   `json:"scope"`
+			Description string   `json:"description"`
+			Path        string   `json:"path"`
+			Author      string   `json:"author"`
+			Version     string   `json:"version"`
+			Tiers       []string `json:"tiers"`
+		}
+		rows := make([]row, 0, len(filtered))
+		for _, e := range filtered {
+			rows = append(rows, row{
+				Name:        e.Name,
+				Scope:       skillregistry.ScopeForPath(resolvedCwd, e.Path),
+				Description: e.Description,
+				Path:        e.Path,
+				Author:      e.Author,
+				Version:     e.Version,
+				Tiers:       e.Tiers,
+			})
+		}
+		data, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(stdout, string(data))
+		return nil
+	}
+
+	if len(filtered) == 0 {
+		if len(wanted) > 0 {
+			_, _ = fmt.Fprintf(stdout, "No skills match tiers %v.\n", wanted)
+		} else {
+			_, _ = fmt.Fprintln(stdout, "No skills found.")
+		}
+		return nil
+	}
+
+	// Tab-separated columns: name, scope, tiers (CSV), version, path.
+	// Stable column order so the output is diff-friendly.
+	_, _ = fmt.Fprintln(stdout, "NAME\tSCOPE\tTIERS\tVERSION\tPATH")
+	for _, e := range filtered {
+		_, _ = fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\n",
+			e.Name,
+			skillregistry.ScopeForPath(resolvedCwd, e.Path),
+			strings.Join(e.Tiers, ","),
+			e.Version,
+			e.Path,
+		)
+	}
+	return nil
+}
+
+// runSkillsTUI launches the bubbletea Sprint 1 MVP. The TUI reads the
+// skills from the same project + user locations as `skills list`, projects
+// them through the tiers package, and renders the two-pane view (Tiers +
+// Skills) until the user quits.
+func runSkillsTUI(args []string, stdout io.Writer) error {
+	var cwd string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: gentle-ai skills tui [--cwd DIR]")
+			return nil
+		case "--cwd":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cwd requires a value")
+			}
+			cwd = args[i+1]
+			i++
+		default:
+			return fmt.Errorf("unknown skills tui argument %q", args[i])
+		}
+	}
+	resolvedCwd, home, err := resolveSkillRegistryDirs(cwd)
+	if err != nil {
+		return err
+	}
+	entries := skillregistry.List(resolvedCwd, home)
+
+	// The bubbletea program replaces stdout/stderr when running, so write
+	// any pre-launch diagnostics to the captured stdout first (e.g. when
+	// no skills are present).
+	if len(entries) == 0 {
+		fmt.Fprintln(stdout, "No skills found. Press q to quit.")
+	}
+
+	m := sktui.New(entries)
+	p := tea.NewProgram(m, tea.WithOutput(stdout))
+	_, err = p.Run()
+	return err
 }
 
 func runUpdate(ctx context.Context, currentVersion string, profile system.PlatformProfile, stdout io.Writer) error {

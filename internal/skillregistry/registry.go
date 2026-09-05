@@ -39,6 +39,21 @@ type SkillEntry struct {
 	Name        string
 	Path        string
 	Description string
+	Author      string
+	Version     string
+	Tiers       []string
+}
+
+// frontmatter holds the parsed YAML header of a SKILL.md. Tiers come from
+// `metadata.tiers: [a, b]` (inline YAML list or block) so skills can be
+// categorized into project-type buckets (universal, vba, web, runtime, ...).
+// Skills without metadata.tiers are treated as `universal` by the filter.
+type frontmatter struct {
+	Name        string
+	Description string
+	Author      string
+	Version     string
+	Tiers       []string
 }
 
 type Result struct {
@@ -244,14 +259,22 @@ func LoadSkill(file string) (SkillEntry, bool) {
 	if err != nil {
 		return SkillEntry{}, false
 	}
-	name, desc := parseFrontmatter(string(data))
-	if strings.TrimSpace(name) == "" {
+	fm := parseFrontmatter(string(data))
+	name := strings.TrimSpace(fm.Name)
+	if name == "" {
 		name = filepath.Base(filepath.Dir(file))
 	}
 	if isExcluded(name) {
 		return SkillEntry{}, false
 	}
-	return SkillEntry{Name: name, Path: file, Description: desc}, true
+	return SkillEntry{
+		Name:        name,
+		Path:        file,
+		Description: fm.Description,
+		Author:      fm.Author,
+		Version:     fm.Version,
+		Tiers:       fm.Tiers,
+	}, true
 }
 
 func RenderRegistry(cwd string, sources []string, entries []SkillEntry) string {
@@ -325,27 +348,29 @@ func uniqueExistingDirs(dirs []string) []string {
 	return out
 }
 
-func parseFrontmatter(source string) (name, description string) {
+func parseFrontmatter(source string) frontmatter {
+	var fm frontmatter
 	source = strings.ReplaceAll(source, "\r\n", "\n")
 	source = strings.ReplaceAll(source, "\r", "\n")
 	if !strings.HasPrefix(source, "---\n") {
-		return "", ""
+		return fm
 	}
 	end := strings.Index(source[4:], "\n---")
 	if end == -1 {
-		return "", ""
+		return fm
 	}
 	end += 4
-	fm := source[4:end]
-	lines := strings.Split(fm, "\n")
+	lines := strings.Split(source[4:end], "\n")
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		m := frontmatterLine.FindStringSubmatch(line)
 		if len(m) != 3 {
 			continue
 		}
-		value := strings.TrimSpace(m[2])
-		if value == ">" || value == "|-" || value == "|" || value == ">-" {
+		key := m[1]
+		rawValue := strings.TrimSpace(m[2])
+		// Block scalars (>, |, -, >-, |-) — accumulate indented continuation lines.
+		if rawValue == ">" || rawValue == "|-" || rawValue == "|" || rawValue == ">-" {
 			var block []string
 			for i+1 < len(lines) {
 				next := lines[i+1]
@@ -360,18 +385,95 @@ func parseFrontmatter(source string) (name, description string) {
 				block = append(block, strings.TrimSpace(next))
 				i++
 			}
-			value = strings.Join(block, " ")
+			rawValue = strings.Join(block, " ")
 		} else {
-			value = strings.Trim(value, `"'`)
+			rawValue = strings.Trim(rawValue, `"'`)
 		}
-		switch m[1] {
+		switch key {
 		case "name":
-			name = value
+			fm.Name = rawValue
 		case "description":
-			description = value
+			fm.Description = rawValue
+		case "metadata":
+			// `metadata:` introduces a nested block. The next indented lines
+			// are the metadata fields. Consume them until indentation drops.
+			// We track the most-recently-seen metadata key so multiline YAML
+			// lists (`tiers:\n  - a\n  - b`) can accumulate into it.
+			var lastMetaKey string
+			i++
+			for i < len(lines) {
+				sub := lines[i]
+				trimmed := strings.TrimLeft(sub, " \t")
+				if sub != "" && !strings.HasPrefix(sub, " ") && !strings.HasPrefix(sub, "\t") {
+					// Back to top-level; re-process this line.
+					i--
+					break
+				}
+				if strings.TrimSpace(sub) == "" {
+					i++
+					continue
+				}
+				// YAML list-item form: `  - value` appends `value` to the
+				// previous metadata key (which must be list-typed).
+				if strings.HasPrefix(trimmed, "- ") || trimmed == "-" {
+					item := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+					item = strings.Trim(item, `"'`)
+					if lastMetaKey == "tiers" {
+						fm.Tiers = append(fm.Tiers, item)
+					}
+					i++
+					continue
+				}
+				subMatch := frontmatterLine.FindStringSubmatch(trimmed)
+				if len(subMatch) != 3 {
+					i++
+					continue
+				}
+				lastMetaKey = subMatch[1]
+				switch subMatch[1] {
+				case "author":
+					fm.Author = strings.Trim(subMatch[2], `"'`)
+				case "version":
+					fm.Version = strings.Trim(subMatch[2], `"'`)
+				case "tiers":
+					fm.Tiers = parseTiersValue(subMatch[2])
+				}
+				i++
+			}
 		}
 	}
-	return name, description
+	return fm
+}
+
+// parseTiersValue parses the right-hand side of `metadata.tiers:`. Accepted
+// shapes: scalar (`vba`), inline list (`[vba, web]`), multiline list
+// (`[vba,\n  web]`), and YAML literal block scalars (which the caller has
+// already flattened into a single string before invoking us). Empty and
+// whitespace-only values yield a nil slice.
+func parseTiersValue(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	// Strip surrounding brackets from inline lists.
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	}
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		// Strip per-item quotes if present.
+		p = strings.Trim(p, `"'`)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 func dedupeBySkillName(entries []SkillEntry, cwd string) []SkillEntry {
