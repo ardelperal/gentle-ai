@@ -363,10 +363,12 @@ type syncRuntime struct {
 	piBackgroundProjection *piBackgroundProjectionPlan
 }
 
-// communityToolReconcileFn is the sync-side seam into communitytool so tests
-// can verify the reconcile contract without shelling out to npm/@latest.
-// Production binds it to communitytool.InstallWithHome.
-var communityToolReconcileFn = communitytool.InstallWithHome
+// communityToolUpgradeFn is the sync-side seam into communitytool so tests
+// can verify the upgrade contract without shelling out to npm/@latest.
+// Production binds it to communitytool.UpgradeCodeGraphIfStale, which
+// runs ONLY the package install on a stale CLI and skips the full
+// InstallWithHome validation path that legacy fixtures would fail.
+var communityToolUpgradeFn = communitytool.UpgradeCodeGraphIfStale
 
 func newSyncRuntime(homeDir string, selection model.Selection, forceCommunityTools bool) (*syncRuntime, error) {
 	backupRoot := filepath.Join(homeDir, ".gentle-ai", "backups")
@@ -989,7 +991,14 @@ type communityToolSyncReconcileStep struct {
 func (s communityToolSyncReconcileStep) ID() string { return s.id }
 
 func (s communityToolSyncReconcileStep) Run() error {
-	_, err := communityToolReconcileFn(
+	// Sync upgrades an EXISTING CodeGraph installation (issue #984). When no
+	// CLI is on PATH this step is a no-op: first installs belong to `gentle-ai
+	// install`, and legacy-migration flows must not trigger a package install
+	// as a side effect of syncing.
+	if _, err := cmdLookPath("codegraph"); err != nil {
+		return nil
+	}
+	_, err := communityToolUpgradeFn(
 		model.CommunityToolCodeGraph,
 		s.workspaceDir,
 		s.homeDir,
